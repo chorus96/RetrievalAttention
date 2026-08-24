@@ -478,7 +478,61 @@ function colHead(s, x, y, w, t, col) {
 }
 
 // =========================================================
-// Slide 12 — 실전 ① 환경 설정 & 커널 설치 (light)
+// Slide 12 — NVIDIA A100 (Ampere) 구조 (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "레퍼런스 하드웨어: NVIDIA A100 (Ampere)", "RetroInfer가 검증·최적화된 GPU — sm_80 · 3세대 Tensor Core");
+// left: GPU hierarchy diagram
+s.addShape(p.ShapeType.roundRect, { x: 0.6, y: 1.95, w: 6.2, h: 4.35, rectRadius: 0.1, fill: { color: INK } });
+s.addText("A100 GPU  (GA100, sm_80)", { x: 0.6, y: 2.1, w: 6.2, h: 0.35, align: "center", fontFace: FB, fontSize: 13, bold: true, color: CYAN, margin: 0 });
+// 108 SM grid (represent with small squares)
+s.addText("108 × SM", { x: 0.85, y: 2.5, w: 2, h: 0.3, fontFace: FB, fontSize: 11, bold: true, color: "8AA0C8", margin: 0 });
+for (let i = 0; i < 36; i++) {
+  const bx = 0.85 + (i % 12) * 0.29, by = 2.82 + Math.floor(i / 12) * 0.29;
+  s.addShape(p.ShapeType.rect, { x: bx, y: by, w: 0.22, h: 0.22, fill: { color: i % 5 === 0 ? TEAL : "27406E" } });
+}
+// one SM detail
+s.addShape(p.ShapeType.roundRect, { x: 0.85, y: 3.95, w: 5.7, h: 1.05, rectRadius: 0.06, fill: { color: INK2 }, line: { color: "27406E", width: 1 } });
+s.addText("SM 하나", { x: 1.0, y: 4.02, w: 2, h: 0.3, fontFace: FB, fontSize: 11, bold: true, color: "AEBEDD", margin: 0 });
+s.addShape(p.ShapeType.roundRect, { x: 1.0, y: 4.35, w: 1.7, h: 0.5, rectRadius: 0.05, fill: { color: "1E3A8A" } });
+s.addText("64× FP32\nCUDA 코어", { x: 1.0, y: 4.35, w: 1.7, h: 0.5, align: "center", valign: "middle", fontFace: F, fontSize: 9, color: "E2E8F0", margin: 0 });
+s.addShape(p.ShapeType.roundRect, { x: 2.85, y: 4.35, w: 1.7, h: 0.5, rectRadius: 0.05, fill: { color: TEAL } });
+s.addText("4× 3세대\nTensor Core", { x: 2.85, y: 4.35, w: 1.7, h: 0.5, align: "center", valign: "middle", fontFace: FB, fontSize: 9, bold: true, color: "042F2C", margin: 0 });
+s.addShape(p.ShapeType.roundRect, { x: 4.7, y: 4.35, w: 1.7, h: 0.5, rectRadius: 0.05, fill: { color: "3B2E6B" } });
+s.addText("192KB\nL1/공유", { x: 4.7, y: 4.35, w: 1.7, h: 0.5, align: "center", valign: "middle", fontFace: F, fontSize: 9, color: "E2E8F0", margin: 0 });
+// memory strip
+s.addShape(p.ShapeType.roundRect, { x: 0.85, y: 5.15, w: 2.75, h: 0.5, rectRadius: 0.05, fill: { color: "0B2540" }, line: { color: "27406E", width: 1 } });
+s.addText("40MB L2 캐시", { x: 0.85, y: 5.15, w: 2.75, h: 0.5, align: "center", valign: "middle", fontFace: F, fontSize: 10, color: "CBD5E1", margin: 0 });
+s.addShape(p.ShapeType.roundRect, { x: 3.7, y: 5.15, w: 2.85, h: 0.5, rectRadius: 0.05, fill: { color: "0B2540" }, line: { color: TEAL, width: 1 } });
+s.addText("HBM2e 40/80GB · ~2TB/s", { x: 3.7, y: 5.15, w: 2.85, h: 0.5, align: "center", valign: "middle", fontFace: F, fontSize: 10, color: "CBD5E1", margin: 0 });
+s.addText("NVLink 3세대 600 GB/s → 멀티 GPU (72B 분산)", { x: 0.85, y: 5.78, w: 5.7, h: 0.35, align: "center", fontFace: F, fontSize: 10, italic: true, color: "6B7A99", margin: 0 });
+// right: spec stats + RetroInfer 연결
+const a100 = [
+  ["108", "SM", "3세대 Tensor Core 108×4"],
+  ["312", "TFLOPS", "BF16/FP16 (희소 시 624)"],
+  ["80", "GB", "HBM2e · ~2.0 TB/s"],
+];
+a100.forEach((st, i) => {
+  const cy = 1.95 + i * 0.92;
+  s.addShape(p.ShapeType.roundRect, { x: 7.1, y: cy, w: 5.6, h: 0.8, rectRadius: 0.08, fill: { color: CARD }, line: { color: LINE, width: 1 } });
+  s.addText(st[0], { x: 7.3, y: cy, w: 1.4, h: 0.8, align: "left", valign: "middle", fontFace: FB, fontSize: 30, bold: true, color: TEAL, margin: 0 });
+  s.addText(st[1], { x: 8.55, y: cy + 0.12, w: 1.0, h: 0.35, valign: "middle", fontFace: FB, fontSize: 13, bold: true, color: NAVY, margin: 0 });
+  s.addText(st[2], { x: 8.55, y: cy + 0.42, w: 4.0, h: 0.3, fontFace: F, fontSize: 11, color: "334155", margin: 0 });
+});
+s.addShape(p.ShapeType.roundRect, { x: 7.1, y: 4.8, w: 5.6, h: 1.5, rectRadius: 0.08, fill: { color: "EAF6F4" }, line: { color: TEAL, width: 1 } });
+s.addText("RetroInfer와의 연결", { x: 7.3, y: 4.92, w: 5.2, h: 0.35, fontFace: FB, fontSize: 13, bold: true, color: "0F766E", margin: 0 });
+const a100link = [
+  "sm_80 Tensor Core ⟨16,8,16⟩·bf16 → batch_gemm_softmax",
+  "cp.async(memory_sm80.h)로 로드·연산 파이프라인",
+  "큰 HBM도 1M 토큰 KV엔 부족 → CPU 오프로드 동기",
+];
+s.addText(a100link.map((t, i) => ({ text: t, options: { bullet: { code: "2022", indent: 12 }, breakLine: i < a100link.length - 1, paraSpaceAfter: 5 } })),
+  { x: 7.4, y: 5.3, w: 5.15, h: 0.95, fontFace: F, fontSize: 11, color: "134E4A", lineSpacingMultiple: 1.05, margin: 0, valign: "top" });
+footer(s); pageNum(s, 12);
+
+// =========================================================
+// Slide 13 — 실전 ① 환경 설정 & 커널 설치 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -513,10 +567,10 @@ s.addText([
   { text: "TIP  ", options: { bold: true, color: "92400E" } },
   { text: "CUDA 12.4 미설치 시 도커 이미지 사용: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", options: { color: "5B4322" } },
 ], { x: 0.85, y: 5.7, w: 11.6, h: 0.62, valign: "middle", fontFace: F, fontSize: 12, margin: 0 });
-footer(s); pageNum(s, 12);
+footer(s); pageNum(s, 13);
 
 // =========================================================
-// Slide 13 — 실전 ② 데모 실행 & API (light)
+// Slide 14 — 실전 ② 데모 실행 & API (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -559,10 +613,10 @@ codeBox(s, 6.9, 2.35, 5.8, 3.95,
   "    attention_type=attn_type,\n" +
   "    inputs_ids=input_ids, ...,\n" +
   "    attn_config=attn_config)", 10.5);
-footer(s); pageNum(s, 13);
+footer(s); pageNum(s, 14);
 
 // =========================================================
-// Slide 14 — 실전 ③ 정확도 벤치마크 (light)
+// Slide 15 — 실전 ③ 정확도 벤치마크 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -584,10 +638,10 @@ bms.forEach((b, i) => {
   codeBox(s, cx + 0.22, y = 2.75, 3.4, 1.95, b[2], 9);
   s.addText(b[3], { x: cx + 0.25, y: 4.85, w: 3.4, h: 1.3, fontFace: F, fontSize: 11, color: "334155", lineSpacingMultiple: 1.1, margin: 0 });
 });
-footer(s); pageNum(s, 14);
+footer(s); pageNum(s, 15);
 
 // =========================================================
-// Slide 15 — 실전 ④ 처리량 재현 & 확장 (light)
+// Slide 16 — 실전 ④ 처리량 재현 & 확장 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -619,10 +673,10 @@ ext.forEach((e, i) => {
   ], { x: 7.5, y: y + 0.02, w: 5.2, h: 0.5, fontSize: 11.5, lineSpacingMultiple: 1.0, margin: 0, valign: "middle" });
   y += 0.78;
 });
-footer(s); pageNum(s, 15);
+footer(s); pageNum(s, 16);
 
 // =========================================================
-// Slide 16 — Summary (dark)
+// Slide 17 — Summary (dark)
 // =========================================================
 s = p.addSlide();
 s.background = { color: INK };
@@ -646,7 +700,7 @@ s.addText([
   { text: "참고문헌   ", options: { bold: true, color: TEAL } },
   { text: "RetroInfer (VLDB 2026, arXiv:2505.02922)  ·  RetrievalAttention (arXiv:2409.10516)", options: { color: "8AA0C8" } },
 ], { x: 0.6, y: 6.35, w: 12.1, h: 0.4, fontFace: F, fontSize: 12, margin: 0 });
-pageNum(s, 16, true);
+pageNum(s, 17, true);
 
 p.writeFile({ fileName: "RetroInfer_세미나.pptx" })
   .then(f => console.log("WROTE", f))
