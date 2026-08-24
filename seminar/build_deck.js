@@ -468,8 +468,161 @@ lims.forEach((r) => {
 });
 footer(s); pageNum(s, 11);
 
+// ---- code box helper ----
+function codeBox(s, x, y, w, h, text, fs) {
+  s.addShape(p.ShapeType.roundRect, { x, y, w, h, rectRadius: 0.06, fill: { color: "0F172A" } });
+  s.addText(text, { x: x + 0.18, y: y + 0.12, w: w - 0.36, h: h - 0.24, fontFace: "Consolas", fontSize: fs || 10.5, color: "E2E8F0", lineSpacingMultiple: 1.14, margin: 0, valign: "top" });
+}
+function colHead(s, x, y, w, t, col) {
+  s.addText(t, { x, y, w, h: 0.36, fontFace: FB, fontSize: 15, bold: true, color: col || NAVY, margin: 0 });
+}
+
 // =========================================================
-// Slide 12 — Summary (dark)
+// Slide 12 — 실전 ① 환경 설정 & 커널 설치 (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "실전 ① 환경 설정 & 커널 설치", "CUDA 12.4 · Python 3.10.16 · conda 권장 (README.kr.md)");
+colHead(s, 0.6, 1.95, 6.0, "1. 패키지 설치", "0F766E");
+codeBox(s, 0.6, 2.35, 6.0, 3.15,
+  "conda create -n retroinfer python=3.10 -y\n" +
+  "conda activate retroinfer\n" +
+  "conda install -y mkl\n" +
+  "conda install -c conda-forge libstdcxx-ng -y\n\n" +
+  "pip install -r requirements.txt\n" +
+  "pip install flash-attn==2.7.3 \\\n" +
+  "    --no-build-isolation\n" +
+  "pip install flashinfer-python==0.2.4 \\\n" +
+  "    -i https://flashinfer.ai/whl/cu124/torch2.5/\n" +
+  "pip install git+.../Starmys/\\\n" +
+  "    flash-attention.git@weighted", 10.5);
+colHead(s, 6.9, 1.95, 5.8, "2. 커널 빌드", NAVY);
+codeBox(s, 6.9, 2.35, 5.8, 3.15,
+  "cd library/\n" +
+  "git clone \\\n" +
+  "  https://github.com/NVIDIA/cutlass.git\n" +
+  "cd retroinfer && pip install . && cd ..\n\n" +
+  "# 선택: MInference prefill\n" +
+  "pip install minference==0.1.6.0\n\n" +
+  "# 선택: XAttention prefill\n" +
+  "git clone .../Block-Sparse-Attention.git\n" +
+  "cd Block-Sparse-Attention && \\\n" +
+  "  python setup.py install", 10.5);
+s.addShape(p.ShapeType.roundRect, { x: 0.6, y: 5.7, w: 12.1, h: 0.62, rectRadius: 0.06, fill: { color: "FEF3E2" }, line: { color: AMBER, width: 1 } });
+s.addText([
+  { text: "TIP  ", options: { bold: true, color: "92400E" } },
+  { text: "CUDA 12.4 미설치 시 도커 이미지 사용: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", options: { color: "5B4322" } },
+], { x: 0.85, y: 5.7, w: 11.6, h: 0.62, valign: "middle", fontFace: F, fontSize: 12, margin: 0 });
+footer(s); pageNum(s, 12);
+
+// =========================================================
+// Slide 13 — 실전 ② 데모 실행 & API (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "실전 ② 데모 실행 & API", "환경 검증용 데모와 Python API 진입점");
+colHead(s, 0.6, 1.95, 6.0, "빠른 데모 — simple_test.py", "0F766E");
+codeBox(s, 0.6, 2.35, 6.0, 1.15,
+  "python -u simple_test.py \\\n" +
+  "       --batch_size 4", 12);
+s.addText([
+  { text: "메모리: ", options: { bold: true, color: TEXT } },
+  { text: "약 35GB GPU + 70GB CPU (batch 4)", options: { color: "334155" } },
+], { x: 0.62, y: 3.62, w: 6.0, h: 0.35, fontFace: F, fontSize: 12, margin: 0 });
+const opts = [
+  ["--gpu_only", "전체 KV를 GPU에 상주"],
+  ["--use_cuda_graph", "CUDA Graph로 런치 오버헤드 감소"],
+  ["--do_sample", "샘플링 디코딩"],
+  ["--prefill_method", "full / xattn / minfer"],
+];
+y = 4.05;
+opts.forEach((o) => {
+  s.addText([
+    { text: o[0] + "  ", options: { fontFace: "Consolas", bold: true, color: "0F766E" } },
+    { text: o[1], options: { fontFace: F, color: "334155" } },
+  ], { x: 0.7, y, w: 5.9, h: 0.36, fontSize: 12, margin: 0 });
+  y += 0.5;
+});
+colHead(s, 6.9, 1.95, 5.8, "Python API", NAVY);
+codeBox(s, 6.9, 2.35, 5.8, 3.95,
+  "from model_hub import load_model, \\\n" +
+  "     load_tokenizer\n" +
+  "from config import generate_config\n\n" +
+  "tokenizer = load_tokenizer(model_name)\n" +
+  "llm = load_model(model_name, max_seq_len,\n" +
+  "                 dtype, device, tokenizer)\n\n" +
+  "attn_config = generate_config(\n" +
+  "    model_name, input_seq_len, \"RetroInfer\",\n" +
+  "    retrieval_budget, estimation_budget,\n" +
+  "    cache_ratio)\n\n" +
+  "out = llm.generate(\n" +
+  "    attention_type=attn_type,\n" +
+  "    inputs_ids=input_ids, ...,\n" +
+  "    attn_config=attn_config)", 10.5);
+footer(s); pageNum(s, 13);
+
+// =========================================================
+// Slide 14 — 실전 ③ 정확도 벤치마크 (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "실전 ③ 정확도 벤치마크", "긴 컨텍스트 표준 벤치마크로 정확도 검증");
+const bms = [
+  ["RULER", "8B5CF6", "bash ruler_run.sh llama-3-8b-1048k \\\n  full RetroInfer 131072 vt bf16 \\\n  0.018 0.232",
+    "128K 컨텍스트 · NIAH/VT/CWE/FWE/QA\n인자: 모델·prefill·attn·길이·태스크·dtype·budget"],
+  ["LongBench", TEAL, "bash longbench_run.sh \\\n  llama-3-8b-1048k RetroInfer \\\n  0.018 0.232 bf16 SQA",
+    "SQA·MQA·SUM·FSL·ST·CC 범주\n인자: 모델·attn·budget·dtype·범주"],
+  ["Reasoning", "F59E0B", "bash eval.sh \\\n  deepseek-ai/DeepSeek-R1-\\\n  Distill-Llama-8B RetroInfer \\\n  aime24 0 -1",
+    "AIME / GPQA 장문 추론 (pass@k)\n인자: 모델·attn·데이터·시작·개수"],
+];
+bms.forEach((b, i) => {
+  const cx = 0.6 + i * 4.15;
+  s.addShape(p.ShapeType.roundRect, { x: cx, y: 1.95, w: 3.85, h: 4.35, rectRadius: 0.1, fill: { color: CARD }, line: { color: LINE, width: 1 } });
+  s.addShape(p.ShapeType.roundRect, { x: cx, y: 1.95, w: 3.85, h: 0.62, rectRadius: 0.1, fill: { color: b[1] } });
+  s.addShape(p.ShapeType.rect, { x: cx, y: 2.35, w: 3.85, h: 0.22, fill: { color: b[1] } });
+  s.addText(b[0], { x: cx + 0.25, y: 1.95, w: 3.35, h: 0.62, valign: "middle", fontFace: FB, fontSize: 17, bold: true, color: WHITE, margin: 0 });
+  codeBox(s, cx + 0.22, y = 2.75, 3.4, 1.95, b[2], 9);
+  s.addText(b[3], { x: cx + 0.25, y: 4.85, w: 3.4, h: 1.3, fontFace: F, fontSize: 11, color: "334155", lineSpacingMultiple: 1.1, margin: 0 });
+});
+footer(s); pageNum(s, 14);
+
+// =========================================================
+// Slide 15 — 실전 ④ 처리량 재현 & 확장 (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "실전 ④ 처리량 재현 & 새 방법 추가", "논문 처리량 재현과 프레임워크 확장");
+colHead(s, 0.6, 1.95, 6.0, "처리량 재현", "0F766E");
+codeBox(s, 0.6, 2.35, 6.0, 1.7,
+  "sudo apt install numactl -y\n\n" +
+  "cd throughput_eval\n" +
+  "bash run.sh", 12);
+s.addShape(p.ShapeType.roundRect, { x: 0.6, y: 4.2, w: 6.0, h: 1.4, rectRadius: 0.08, fill: { color: "EAF6F4" }, line: { color: TEAL, width: 1 } });
+s.addText([
+  { text: "실험 환경 (논문)\n", options: { bold: true, color: "0F766E" } },
+  { text: "Azure 4-NUMA A100 머신 · NUMA 노드당 24코어 · 475GB CPU · 80GB A100 ×2", options: { color: "134E4A" } },
+], { x: 0.85, y: 4.35, w: 5.5, h: 1.1, fontFace: F, fontSize: 12, lineSpacingMultiple: 1.15, margin: 0, valign: "top" });
+colHead(s, 6.9, 1.95, 5.8, "새 희소성 방법 추가 — 5단계", NAVY);
+const ext = [
+  ["cache_hub/", "KV 캐시 관리 로직 추가"],
+  ["attn_hub/", "어텐션 연산 로직 추가"],
+  ["config/config.py", "설정 옵션 등록"],
+  ["model_hub/llama.py · qwen.py", "init_kv_cache · decode_attention · parameter_move 갱신"],
+  ["--attn_type", "지정해 실행"],
+];
+y = 2.4;
+ext.forEach((e, i) => {
+  chip(s, 6.9, y, String(i + 1), NAVY);
+  s.addText([
+    { text: e[0] + "  ", options: { fontFace: "Consolas", bold: true, color: "0F766E" } },
+    { text: e[1], options: { fontFace: F, color: "334155" } },
+  ], { x: 7.5, y: y + 0.02, w: 5.2, h: 0.5, fontSize: 11.5, lineSpacingMultiple: 1.0, margin: 0, valign: "middle" });
+  y += 0.78;
+});
+footer(s); pageNum(s, 15);
+
+// =========================================================
+// Slide 16 — Summary (dark)
 // =========================================================
 s = p.addSlide();
 s.background = { color: INK };
@@ -493,8 +646,8 @@ s.addText([
   { text: "참고문헌   ", options: { bold: true, color: TEAL } },
   { text: "RetroInfer (VLDB 2026, arXiv:2505.02922)  ·  RetrievalAttention (arXiv:2409.10516)", options: { color: "8AA0C8" } },
 ], { x: 0.6, y: 6.35, w: 12.1, h: 0.4, fontFace: F, fontSize: 12, margin: 0 });
-pageNum(s, 12, true);
+pageNum(s, 16, true);
 
-p.writeFile({ fileName: "/tmp/claude-0/-home-user-RetrievalAttention/64de5d47-581f-5735-8931-e1c1498d69a5/scratchpad/RetroInfer_세미나.pptx" })
+p.writeFile({ fileName: "RetroInfer_세미나.pptx" })
   .then(f => console.log("WROTE", f))
   .catch(e => { console.error(e); process.exit(1); });
