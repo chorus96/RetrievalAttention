@@ -8,6 +8,9 @@
 3. [online-softmax 병합](#3-online-softmax-병합)
 4. [CUTLASS · Tensor Core](#4-cutlass--tensor-core)
 5. [segmented k-means](#5-segmented-k-means)
+6. [GQA (Grouped-Query Attention)](#6-gqa-grouped-query-attention)
+7. [RoPE · YaRN](#7-rope--yarn)
+8. [XAttention · MInference](#8-xattention--minference)
 
 ---
 
@@ -454,3 +457,152 @@ flowchart LR
 - Lloyd, *Least squares quantization in PCM*, 1982 — k-means의 고전
 - Tillet et al., *Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations*, 2019
 - 코드: [`cache_hub/kmeans.py`](../cache_hub/kmeans.py), [`config/config.py`](../config/config.py) (클러스터 수 보정)
+
+---
+
+## 6. GQA (Grouped-Query Attention)
+
+> 발표 자료 연관 슬라이드: **2 (문제 정의 — KV 메모리)**, **4 (아키텍처)**
+
+**GQA = Grouped-Query Attention (그룹 쿼리 어텐션)**. KV 캐시 크기를 줄이는 어텐션 변형으로, 긴 컨텍스트를 다루는 모든 시스템(RetroInfer 포함)의 전제입니다.
+
+### 6.1 MHA → MQA → GQA 스펙트럼
+
+| 방식 | Query 헤드 | KV 헤드 | KV 캐시 |
+|---|---|---|---|
+| **MHA** (Multi-Head) | H개 | H개 | 큼 (헤드마다 K,V) |
+| **MQA** (Multi-Query) | H개 | **1개** (전 헤드 공유) | 최소 (품질 저하 위험) |
+| **GQA** (Grouped-Query) | H개 | **G개** (그룹당 공유) | 중간 (품질·메모리 균형) |
+
+GQA는 **여러 query 헤드가 하나의 K/V 헤드를 공유**합니다. `group_size = num_heads / num_kv_heads` 개의 query 헤드가 한 KV 헤드를 나눠 씁니다. 예: Llama-3-8B는 query 32헤드, KV 8헤드 → group_size=4.
+
+### 6.2 왜 RetroInfer에 중요한가
+
+RetroInfer의 근본 과제는 **KV 캐시가 GPU 메모리를 압도**하는 것(슬라이드 2)입니다. GQA는 그 KV 캐시를 **H/G 배로 줄여** 애초에 저장·이동할 양을 감소시킵니다. 즉 GQA와 RetroInfer(벡터 검색+CPU 오프로드)는 **같은 문제(KV 메모리)를 다른 층위에서** 공략하며 상호 보완적입니다.
+
+### 6.3 코드에서의 처리
+
+- **QKV projection**: `model_hub/llama.py`의 `wqkv`가 query는 `hidden_size`, K/V는 `hidden_size / num_key_value_groups`로 쪼갭니다.
+  ```python
+  query, key, value = qkv.split([hidden_size,
+                                 hidden_size // num_kv_groups,
+                                 hidden_size // num_kv_groups], dim=-1)
+  ```
+- **그룹 매핑**: RetroInfer 커널은 `batch_groups = batch_size × kv_head`(그룹 단위)로 동작하고, query를 `(batch_groups, 1, group_size, head_dim)`로 재구성해 한 KV 헤드에 group_size개 query를 함께 처리합니다(`retroinfer_cache.sparse_attention`, `dense_attention`).
+- MInference/XAttention prefill도 `group = head // kv_group_size`로 KV 헤드를 매핑합니다(`attn_hub/minfer.py`).
+
+### 6.4 한 줄 정리
+
+**GQA** = "여러 query 헤드가 KV 헤드를 그룹 단위로 공유해 KV 캐시를 줄이는 어텐션." RetroInfer는 GQA로 줄어든 KV를 다시 벡터 검색·CPU 오프로드로 확장 처리하며, 커널은 그룹 단위(batch×kv_head)로 query를 묶어 계산합니다.
+
+### 참고문헌
+- Ainslie et al., *GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints*, 2023. [arXiv:2305.13245](https://arxiv.org/abs/2305.13245)
+- 코드: [`model_hub/llama.py`](../model_hub/llama.py), [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py)
+
+---
+
+## 7. RoPE · YaRN
+
+> 발표 자료 연관 슬라이드: **6 (Wave Index — 캐시에 넣기 전 위치 인코딩 적용)**
+
+**RoPE**(Rotary Position Embedding)와 그 장문 확장 기법 **YaRN**은 "긴 컨텍스트 모델"이 성립하는 근본 장치입니다. RetroInfer가 다루는 128K~1M 토큰 모델은 모두 이 위에 서 있습니다.
+
+### 7.1 RoPE — 회전으로 위치를 인코딩
+
+RoPE는 위치 정보를 **query·key 벡터를 위치각(θ)만큼 회전**시켜 주입합니다.
+
+- 위치 m의 벡터에 회전행렬 R(mθ)를 곱함 → 내적 `q_m · k_n`이 **상대 위치 (m−n)** 에만 의존.
+- 절대 위치 임베딩과 달리 **상대 위치**를 자연스럽게 표현하고, 학습 길이 밖으로도 어느 정도 외삽 가능.
+- 주파수는 차원마다 다름: `θ_i = base^(−2i/d)` (base 보통 10000).
+
+### 7.2 YaRN — RoPE의 컨텍스트 확장
+
+원래 4K~8K로 학습된 모델을 128K~1M로 늘리려면 RoPE를 그대로 쓰면 성능이 무너집니다. **YaRN**(Yet another RoPE extensioN)은 주파수 대역별로 다르게 보간(NTK-aware interpolation)해 장문에서도 안정적으로 동작하게 합니다.
+
+- 고주파(가까운 위치 담당)는 거의 그대로, 저주파(먼 위치 담당)는 보간 → 램프(ramp) 함수로 부드럽게 전환.
+- Qwen2.5 등 장문 모델이 이 방식으로 컨텍스트를 확장합니다.
+
+### 7.3 코드에서의 처리
+
+- **Llama** (`model_hub/llama.py`): `apply_rotary_pos_emb` / `position_embedd`가 RoPE를 적용. cos/sin 캐시(`_set_cos_sin_cache`)와 `attention_scaling` 사용. 실제 회전은 `flashinfer.rope.apply_rope_with_cos_sin_cache_inplace`.
+- **Qwen** (`model_hub/qwen.py`): `_set_cos_sin_cache`가 **YaRN** 보정을 구현 — `find_correction_dim`, `find_correction_range`, `linear_ramp_factor`로 대역별 보간 계수를 계산해 장문 RoPE를 만듭니다.
+
+> **RetroInfer와의 연결**: RoPE는 **KV를 캐시(=wave index)에 넣기 전에** query/key에 적용됩니다(`layer_prefill`/`layer_decode`에서 wqkv 직후 `position_embedd`). 따라서 클러스터링·검색되는 key 벡터에는 이미 위치 정보가 담겨 있고, 어텐션 점수(내적)가 상대 위치를 반영합니다.
+
+### 7.4 한 줄 정리
+
+**RoPE** = "벡터를 위치각만큼 회전시켜 상대 위치를 내적에 담는 위치 인코딩", **YaRN** = "그 RoPE를 주파수 대역별 보간으로 장문까지 확장하는 기법". RetroInfer의 긴 컨텍스트 모델(Llama-3-8B-1048K, Qwen2.5)은 이 위에서 동작하며, RoPE는 캐시·검색 이전에 적용됩니다.
+
+### 참고문헌
+- Su et al., *RoFormer: Enhanced Transformer with Rotary Position Embedding*, 2021. [arXiv:2104.09864](https://arxiv.org/abs/2104.09864)
+- Peng et al., *YaRN: Efficient Context Window Extension of Large Language Models*, 2023. [arXiv:2309.00071](https://arxiv.org/abs/2309.00071)
+- 코드: [`model_hub/llama.py`](../model_hub/llama.py), [`model_hub/qwen.py`](../model_hub/qwen.py) (`_set_cos_sin_cache`)
+
+---
+
+## 8. XAttention · MInference
+
+> 발표 자료 연관 슬라이드: **8 (실행 흐름 — prefill 방법)**, **10 (종단간 성능, RetroInfer+XAttention)**
+
+RetroInfer는 **디코딩(decode)** 을 가속하는 시스템입니다. 반면 **XAttention**과 **MInference**는 **prefill**(입력 컨텍스트를 한 번에 처리하는 단계)을 희소화하는 방법으로, RetroInfer와 **상호 보완**합니다. `--prefill_method` 인자로 선택합니다(`full` / `xattn` / `minfer`).
+
+### 8.1 왜 prefill도 문제인가
+
+- **Prefill**: 긴 입력(예: 120K 토큰)에 대해 full attention을 한 번에 → 여기서도 O(N²) 비용 발생.
+- **Decode**: 이후 토큰을 하나씩 생성 → RetroInfer가 담당.
+
+긴 입력·짧은 생성(예: 120K+4K) 시나리오에서는 **prefill이 병목**이 되므로, prefill 희소화가 종단간 처리량에 중요합니다(발표 슬라이드 10의 `120K+4K` 실험).
+
+### 8.2 MInference — 헤드별 동적 희소 패턴
+
+[MInference](https://arxiv.org/pdf/2407.02490)는 각 어텐션 헤드가 특정 **희소 패턴**을 따른다는 관찰을 이용합니다(`attn_hub/minfer.py`).
+
+| 패턴 | 설명 |
+|---|---|
+| `vertical_and_slash` | 특정 열(vertical)과 대각선(slash) 위치에 어텐션 집중 |
+| `block_sparse` | 블록 단위로 상위 중요 블록만 |
+| `stream_llm` | 최근 토큰 + 싱크(streaming) |
+
+- 헤드별 최적 패턴은 오프라인 프로파일링 결과(`model_hub/minfer_patterns.py`)로 주입됩니다.
+- 실행 시 최근 64개 query로 점수를 매겨 vertical/slash 위치를 top-k 선택 → 희소 어텐션.
+
+### 8.3 XAttention — 대각선 기반 블록 선택
+
+[XAttention](https://arxiv.org/pdf/2503.16428)은 **antidiagonal(반대각선) 점수**로 블록 중요도를 추정해, 임계값(threshold)을 넘는 블록만 계산합니다(`attn_hub/xattn.py`).
+
+- **추정(estimate)**: Q/K를 stride로 다운샘플해 저해상도 어텐션 점수 → 블록별 합 (Triton 커널로 가속).
+- **선택(select)**: 누적합이 threshold에 도달할 때까지 블록 선택 (`find_blocks_chunked`). threshold는 레이어별 프로파일(`model_hub/xattn_thresholds.py`).
+- **계산(compute)**: 선택 블록에만 `block_sparse_attn_func` 적용.
+
+### 8.4 RetroInfer와의 관계 — 조합 가능
+
+prefill(XAttention/MInference)과 decode(RetroInfer)는 서로 다른 단계라 **함께 쓸 수 있습니다**.
+
+```mermaid
+flowchart LR
+    In["긴 입력 컨텍스트"] --> P{prefill_method}
+    P -->|full| PF["Full FlashAttention"]
+    P -->|xattn| PX["XAttention (블록 희소)"]
+    P -->|minfer| PM["MInference (패턴 희소)"]
+    PF --> KV["KV 캐시 + wave index 구축"]
+    PX --> KV
+    PM --> KV
+    KV --> D["RetroInfer decode<br/>(희소 검색)"]
+```
+
+발표 슬라이드 10의 `run_e2e.sh`는 실제로 **"RetroInfer + XAttention"** 조합을 측정합니다 — prefill은 XAttention으로, decode는 RetroInfer로 각각 가속.
+
+### 8.5 코드·설치 참고
+
+- 선택적 의존성이라 미설치 시 `attn_hub/__init__.py`가 스텁으로 대체(해당 방법을 쓸 때만 필요).
+- MInference: `pip install minference==0.1.6.0`
+- XAttention: Block-Sparse-Attention 커널 빌드 필요(README 참고), Triton은 A100/H100 계열에서만 활성.
+
+### 8.6 한 줄 정리
+
+**MInference·XAttention** = "prefill 단계를 희소화하는 방법"(헤드별 패턴 / 블록 임계값 선택). RetroInfer는 decode를 희소화하므로 둘은 **직교·보완적**이며, `--prefill_method`로 조합해 긴-입력 시나리오의 종단간 처리량을 함께 끌어올립니다.
+
+### 참고문헌
+- Jiang et al., *MInference: Accelerating Pre-filling for Long-Context LLMs via Dynamic Sparse Attention*, 2024. [arXiv:2407.02490](https://arxiv.org/abs/2407.02490)
+- Xu et al., *XAttention: Block Sparse Attention with Antidiagonal Scoring*, 2025. [arXiv:2503.16428](https://arxiv.org/abs/2503.16428)
+- 코드: [`attn_hub/minfer.py`](../attn_hub/minfer.py), [`attn_hub/xattn.py`](../attn_hub/xattn.py), [`model_hub/minfer_patterns.py`](../model_hub/minfer_patterns.py), [`model_hub/xattn_thresholds.py`](../model_hub/xattn_thresholds.py)
