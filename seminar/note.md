@@ -11,6 +11,12 @@
 6. [GQA (Grouped-Query Attention)](#6-gqa-grouped-query-attention)
 7. [RoPE · YaRN](#7-rope--yarn)
 8. [XAttention · MInference](#8-xattention--minference)
+9. [Wave Buffer / LRU 캐시 상세](#9-wave-buffer--lru-캐시-상세)
+10. [3-Zone 세부 (accuracy bound)](#10-3-zone-세부-accuracy-bound)
+11. [KV cache 일반](#11-kv-cache-일반)
+12. [vLLM (베이스라인)](#12-vllm-베이스라인)
+13. [CUDA Graph](#13-cuda-graph)
+14. [NUMA · 스레드풀](#14-numa--스레드풀)
 
 ---
 
@@ -606,3 +612,261 @@ flowchart LR
 - Jiang et al., *MInference: Accelerating Pre-filling for Long-Context LLMs via Dynamic Sparse Attention*, 2024. [arXiv:2407.02490](https://arxiv.org/abs/2407.02490)
 - Xu et al., *XAttention: Block Sparse Attention with Antidiagonal Scoring*, 2025. [arXiv:2503.16428](https://arxiv.org/abs/2503.16428)
 - 코드: [`attn_hub/minfer.py`](../attn_hub/minfer.py), [`attn_hub/xattn.py`](../attn_hub/xattn.py), [`model_hub/minfer_patterns.py`](../model_hub/minfer_patterns.py), [`model_hub/xattn_thresholds.py`](../model_hub/xattn_thresholds.py)
+
+---
+
+## 9. Wave Buffer / LRU 캐시 상세
+
+> 발표 자료 연관 슬라이드: **7 (Wave Buffer)**
+
+Wave Buffer는 "전체 KV는 CPU에, 자주 쓰는 것만 GPU에"를 실현하는 **GPU–CPU 협력 캐시**입니다. 그 심장은 그룹마다 하나씩 있는 **LRU 블록 캐시(`BufferManager`)** 입니다(`library/retroinfer/retroinfer_kernels/src/wave_buffer_cpu.cpp`).
+
+### 9.1 데이터 구조
+
+| 구조 | 역할 |
+|---|---|
+| **블록(block)** | KV 저장의 최소 단위 = `block_size`개 벡터. GPU 캐시는 `capacity`개 블록 |
+| `ClusterDescriptor` | 클러스터 하나의 메타: `inBlockCache`(GPU 상주 여부), `GPUBlockIDs`(할당 블록), `CPUStartIndex`(CPU 원본 위치), `BlockNum`, `LastBlockSize`, `LRUEntryPointer` |
+| `free_block_ids` | 비어 있는 GPU 블록 집합 |
+| `lru_keys` | 최근 사용 순서 리스트(앞=최근, 뒤=오래됨) |
+
+### 9.2 한 스텝의 두 단계 — access → 비동기 update
+
+`para_batch_access`가 두 단계를 조율합니다.
+
+**① `batch_access` (동기, 즉시 필요)** — 검색된 nprobe 클러스터를 순회하며:
+- **hit** (이미 GPU 캐시): `GPUBlockIDs`를 hit 목록에 기록 → GPU에서 바로 재사용
+- **miss** (GPU에 없음): `CPUStartIndex`를 miss 목록에 기록 → CPU에서 gather 필요
+- `max_consider_block`(=buffer_size) 초과 시 경고 후 남은 클러스터 스킵
+
+**② `batch_update` (비동기, LRU 유지)** — access 직후 스레드풀에 제출되어 백그라운드로:
+- hit 키의 **LRU 순서 갱신**(리스트 앞으로)
+- miss 키 중 용량 내에서 admit 가능한 만큼 선정 → 공간 부족 시 `removeLeastRecentlyUsed()`로 **가장 오래된 클러스터를 evict**(블록 반납) → 새 블록 할당
+
+이 **비동기 update**가 핵심입니다: LRU 관리(CPU 작업)를 GPU 어텐션 연산과 **겹쳐서(overlap)** 지연을 숨깁니다.
+
+### 9.3 GPU 측과의 연동
+
+CPU가 만든 hit/miss/update **인덱스**를 GPU gather/scatter 커널이 소비합니다(9번↔`copy_kernel.cuh`).
+
+```mermaid
+flowchart TD
+    Q["검색된 nprobe 클러스터"] --> BA["batch_access (CPU)"]
+    BA -->|hit 블록 id| GH["GPU 캐시에서 재사용"]
+    BA -->|miss 블록 id| GM["CPU→GPU gather (gather_copy_and_concat)"]
+    GH --> ATTN["weighted_flash_decoding"]
+    GM --> ATTN
+    BA -.비동기.-> BU["batch_update (LRU admit/evict)"]
+    BU -->|update 블록 id| SC["gather_copy_and_scatter<br/>(사용 페이지 GPU 캐시에 admit)"]
+    ATTN --> SC
+```
+
+### 9.4 왜 LRU인가
+
+어텐션은 **시간적 지역성**도 있습니다 — 최근 참조된 클러스터가 다음 스텝에도 자주 쓰입니다. LRU는 이를 활용해 **hit율을 높여 CPU→GPU 전송을 줄입니다**. 자주 쓰는 클러스터는 GPU에 상주하고, 드문 것만 CPU에서 그때그때 가져옵니다.
+
+### 9.5 한 줄 정리
+
+**Wave Buffer** = "CPU 대용량 KV + GPU 블록 LRU 캐시 + 비동기 admit/evict". access(hit/miss 판정)는 즉시, update(LRU 유지)는 비동기로 어텐션과 겹쳐 수행 → 전송 지연을 은닉하며 높은 처리량을 유지합니다.
+
+### 참고문헌
+- 코드: [`library/retroinfer/retroinfer_kernels/src/wave_buffer_cpu.cpp`](../library/retroinfer/retroinfer_kernels/src/wave_buffer_cpu.cpp), [`copy_kernel.cuh`](../library/retroinfer/retroinfer_kernels/src/copy_kernel.cuh)
+
+---
+
+## 10. 3-Zone 세부 (accuracy bound)
+
+> 발표 자료 연관 슬라이드: **5 (3-Zone 어텐션)**
+
+발표에서 3개 존을 개괄했다면, 여기서는 **왜 정확도가 보장되는가(accuracy-bounded)** 를 자세히 봅니다.
+
+### 10.1 세 존의 정의 (코드 기준)
+
+| Zone | 파라미터 | 대상 | 계산 |
+|---|---|---|---|
+| **Steady** | `static_pattern_start` / `static_pattern_end` | 항상 보는 고정 토큰(싱크 + 최근) | 전량 정확 어텐션 |
+| **Retrieval** | `nprobe = ⌈n_centroids × retrieval_budget⌉` | query와 가까운 상위 클러스터 | 실제 KV로 정확 어텐션 |
+| **Estimation** | `es_cluster_num = ⌈n_centroids × estimation_budget⌉` | 나머지(검색 안 된) 클러스터 | centroid로 **근사** |
+
+### 10.2 핵심 — estimation이 오차를 "경계"짓는 방법
+
+일반 ANN은 nprobe 밖 클러스터를 **그냥 버립니다** → 그 토큰들의 softmax 기여가 통째로 사라져 오차 발생.
+
+RetroInfer는 다르게 합니다. 나머지 클러스터 각각에 대해:
+- **centroid**를 대표 key로,
+- **`value_sum`**(클러스터 내 V 합)과 **`cluster_size`**(토큰 수)를 가지고,
+
+그 클러스터가 softmax 분모·분자에 기여할 값을 **근사 추정**합니다. 즉 "정확히 계산" 대신 "평균으로 근사"하되, **분모에는 반영**합니다.
+
+```
+정확 어텐션 분모 = Σ_all e^(sᵢ)
+RetroInfer 분모  = Σ_steady∪retrieval e^(sᵢ)   (정확)
+                 + Σ_estimation clusters  cluster_size · e^(q·centroid)  (근사)
+```
+
+버려진 항이 없으므로 **정규화 상수(분모)가 전체를 거의 반영** → 검색 누락으로 인한 오차가 **경계 안에 갇힙니다(accuracy-bounded)**. 이 근사 결과 `(es_out, es_lse)`가 [online-softmax 병합](#3-online-softmax-병합)으로 정확 존과 합쳐집니다.
+
+### 10.3 예산(budget)과 트레이드오프
+
+- `retrieval_budget`↑ → 정확 계산 클러스터↑ → 정확도↑, 속도↓
+- `estimation_budget`↑ → 근사로 덮는 범위↑ → 누락 오차↓ (근사이므로 비용은 저렴)
+- `cache_ratio` → GPU 블록 캐시 용량 조절
+- README 예시 `0.018 / 0.232` = retrieval 1.8% + estimation 23.2% → **전체의 약 25% 클러스터만 건드리고도** 정확도 유지.
+
+### 10.4 폴백 — 짧은 컨텍스트
+
+컨텍스트가 짧으면 클러스터링 이득이 없어, `attn_func`가 `dense_attention`(steady 존 전량 어텐션)으로 자동 전환됩니다(`retroinfer_cache.py`).
+
+### 10.5 한 줄 정리
+
+**3-Zone accuracy bound** = "steady·retrieval는 정확히, estimation은 centroid·value_sum·cluster_size로 근사하되 **분모에 반영**해 검색 누락 오차를 경계짓는다." budget ~25%로도 전량 어텐션에 근접합니다.
+
+### 참고문헌
+- 코드: [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`sparse_attention`), [`config/config.py`](../config/config.py)
+
+---
+
+## 11. KV cache 일반
+
+> 발표 자료 연관 슬라이드: **2 (문제 정의)**, **4 (아키텍처)**
+
+RetroInfer가 최적화하는 대상 자체인 **KV 캐시**의 기본을 정리합니다.
+
+### 11.1 왜 존재하나 — 재계산 회피
+
+자기회귀 디코딩은 토큰을 하나씩 생성하는데, 매 스텝 어텐션은 **모든 과거 토큰의 Key·Value**가 필요합니다. 이를 매번 다시 계산하면 O(N²)이 되므로, 한 번 계산한 K·V를 **저장(cache)** 해 재사용합니다. 새 토큰은 자기 K·V만 추가하면 됩니다.
+
+### 11.2 메모리 비용
+
+```
+KV 캐시 크기 = 2 (K,V) × layer_num × batch × seq_len × kv_head × head_dim × dtype_bytes
+```
+
+예: Llama-3-8B(32 layer, kv_head 8, head_dim 128), 120K 토큰, bf16, batch 1
+→ 2 × 32 × 1 × 120000 × 8 × 128 × 2 ≈ **15.7 GB** (batch·길이에 선형 증가). 1M 토큰이면 수백 GB → GPU 불가.
+
+### 11.3 RetroInfer의 두 가지 KV 캐시 구현
+
+| 구현 | 저장 위치 | 용도 |
+|---|---|---|
+| `flash_attn_cache` | 전부 GPU (여유 없으면 CPU pinned 오프로드) | `Full_Flash_Attn` 기준선 |
+| `retroinfer_cache` | CPU 대용량 + GPU 작업 버퍼 | RetroInfer(오프로드) |
+| `retroinfer_cache_gpu` | 전부 GPU | RetroInfer(`--gpu_only`) |
+
+공통 인터페이스: `prefill_update_kv_cache`(입력 K·V 기록), `decode_update_kv_cache`(스텝마다 1토큰 추가). 좌측 패딩을 고려한 `valid_length` 관리.
+
+### 11.4 한 줄 정리
+
+**KV cache** = "자기회귀 디코딩에서 과거 K·V를 저장해 재계산을 피하는 메모리." 컨텍스트 길이에 선형으로 커져 긴 컨텍스트의 근본 병목이 되며, RetroInfer는 이를 벡터 인덱스 + CPU 오프로드로 다룹니다.
+
+### 참고문헌
+- 코드: [`cache_hub/cache.py`](../cache_hub/cache.py), [`cache_hub/flash_attn_cache.py`](../cache_hub/flash_attn_cache.py)
+
+---
+
+## 12. vLLM (베이스라인)
+
+> 발표 자료 연관 슬라이드: **10 (성능 비교)**
+
+**vLLM**은 고처리량 LLM 서빙 엔진의 사실상 표준입니다. RetroInfer는 종단간 처리량 실험에서 이를 **베이스라인**으로 사용합니다(`throughput_eval/test_vllm.py`).
+
+### 12.1 vLLM의 핵심 — PagedAttention
+
+vLLM의 대표 기술 **PagedAttention**은 OS의 가상 메모리 페이징처럼, **KV 캐시를 고정 크기 블록(page)으로 관리**합니다.
+
+- KV 캐시 단편화를 줄이고 메모리 활용률↑ → 더 큰 배치/처리량.
+- continuous batching(요청을 동적으로 묶음)과 결합해 서빙 처리량 극대화.
+
+> 흥미로운 대응: RetroInfer의 wave buffer도 KV를 **블록 단위 LRU 캐시**로 관리합니다(9절). "KV를 블록으로 페이징한다"는 발상이 닮았지만, vLLM은 *GPU 내* 관리, RetroInfer는 *GPU–CPU 협력 + 희소 검색*이라는 점이 다릅니다.
+
+### 12.2 왜 베이스라인인가 & 버전 고정
+
+- RetroInfer가 보고하는 종단간 처리량은 "정확 어텐션의 최강 서빙 엔진(vLLM)" 대비 얼마나 빠른지를 보여줍니다.
+- 저장소는 `vllm==0.6.5`로 고정. 이유: ① torch 2.5.1/cu124 스택 정합성, ② 코드가 구(V0) 엔진 API(`output.metrics`의 arrival/first_token/finished_time)에 의존, ③ 논문 수치 재현성.
+- vLLM은 RetroInfer의 핵심 의존성이 **아니며**, `throughput_eval`에서만 필요합니다.
+
+### 12.3 한 줄 정리
+
+**vLLM** = "PagedAttention 기반 고처리량 서빙 엔진". RetroInfer의 처리량 비교 기준선이며, KV를 블록으로 다루는 발상은 닮았으나 RetroInfer는 여기에 CPU 오프로드와 희소 검색을 더해 넘어섭니다.
+
+### 참고문헌
+- Kwon et al., *Efficient Memory Management for Large Language Model Serving with PagedAttention*, SOSP 2023. [arXiv:2309.06180](https://arxiv.org/abs/2309.06180)
+- 코드: [`throughput_eval/test_vllm.py`](../throughput_eval/test_vllm.py)
+
+---
+
+## 13. CUDA Graph
+
+> 발표 자료 연관 슬라이드: **7·8 (디코딩 실행)** — 옵션 `--use_cuda_graph`
+
+디코딩은 매 스텝 **작은 커널을 수십 개** 실행합니다. 이때 커널 하나하나를 CPU가 launch하는 오버헤드가 무시 못 할 비중이 됩니다. **CUDA Graph**가 이를 없앱니다.
+
+### 13.1 원리 — 캡처 후 재생(capture & replay)
+
+- **캡처(capture)**: 한 번의 실행에서 발생하는 커널 launch 순서·의존성을 **하나의 그래프로 기록**.
+- **재생(replay)**: 이후 스텝에서는 개별 launch 대신 **그래프 하나를 replay** → CPU launch 오버헤드가 거의 사라지고 GPU가 쉬지 않고 돌아감.
+
+### 13.2 RetroInfer에서의 사용
+
+`--use_cuda_graph` 설정 시:
+- prefill 직후 `capture_cuda_graph()`가 디코딩 단계들을 그래프로 캡처(`retroinfer_cache.py`).
+- 이후 `sparse_attention_with_cudagraph`가 topk / estimation / attention / update 단계를 각각 **`.replay()`** 로 실행.
+
+**제약**: 그래프는 고정된 shape·메모리 주소를 전제하므로, RetroInfer는 버퍼를 **사전 할당**하고 매 스텝 query를 고정 `query_buffer`에 복사해 넣는 방식으로 캡처 조건을 맞춥니다.
+
+### 13.3 효과
+
+작은 커널이 많은 저지연 디코딩에서 특히 효과적 — 발표 슬라이드의 throughput 실험 다수가 `--use_cuda_graph`로 측정됩니다(`run_different_*.sh`).
+
+### 13.4 한 줄 정리
+
+**CUDA Graph** = "커널 launch 시퀀스를 그래프로 캡처해 replay함으로써 CPU launch 오버헤드를 제거하는 기법". RetroInfer는 사전 할당 버퍼로 디코딩 단계를 캡처·재생해 처리량을 끌어올립니다.
+
+### 참고문헌
+- NVIDIA, *Getting Started with CUDA Graphs* (developer blog)
+- 코드: [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`capture_cuda_graph`, `sparse_attention_with_cudagraph`)
+
+---
+
+## 14. NUMA · 스레드풀
+
+> 발표 자료 연관 슬라이드: **7 (Wave Buffer — CPU 병렬)**
+
+Wave Buffer의 CPU 작업(클러스터 조직, gather, LRU 관리)은 **여러 CPU 코어에 병렬화**됩니다. 이때 **NUMA**와 **스레드풀**이 성능을 좌우합니다.
+
+### 14.1 NUMA — 메모리도 지역성이 있다
+
+**NUMA**(Non-Uniform Memory Access)는 다중 소켓 서버에서 **CPU마다 "가까운 메모리"와 "먼 메모리"가 다른** 구조입니다. 먼 NUMA 노드의 메모리 접근은 느립니다.
+
+- RetroInfer의 CPU KV 저장소는 수십~수백 GB → NUMA 배치가 중요.
+- 실행 스크립트가 `numactl`로 프로세스를 특정 노드에 고정: `numactl --cpunodebind=0 --membind=0`(대배치는 `--membind=0,1`로 여러 노드). 논문 실험은 4 NUMA 노드 A100 머신(`throughput_eval/*.sh`).
+- `config/config.py`의 `get_numa_node_core_count`가 NUMA 노드의 코어 수를 읽어 스레드풀 크기를 정합니다.
+
+### 14.2 스레드풀 — 코어 고정 병렬 실행
+
+`thread_pool.hpp`의 `MyThreadPool`:
+- 시작 시 워커 스레드를 생성하고, 각 워커를 **특정 코어에 고정(`set_affinity`, `sched_setaffinity`)** → 캐시·NUMA 지역성 유지.
+- 작업 큐 + condition_variable로 대기/통지, `num_tasks` 원자 카운트로 완료 감지(`Wait`).
+- **레이어 간 재사용**(매 레이어 새로 만들지 않음)으로 스레드 생성 비용 제거.
+
+`WaveBufferCPU`가 이 풀에 작업을 제출합니다: `async_construction`(인덱스 구축), `update_kv`(증분 갱신), `batch_access`/`batch_update`(LRU) — 모두 `group_per_thread` 단위로 그룹을 나눠 병렬 처리.
+
+```mermaid
+flowchart LR
+    WB["WaveBufferCPU"] -->|그룹 분할 작업 제출| TP["MyThreadPool"]
+    TP --> W0["워커0 (코어0 고정)"]
+    TP --> W1["워커1 (코어1 고정)"]
+    TP --> Wn["워커N"]
+    subgraph NUMA["NUMA 노드 (numactl 바인딩)"]
+      W0 --- MEM["로컬 CPU 메모리<br/>(KV 저장소)"]
+      W1 --- MEM
+      Wn --- MEM
+    end
+```
+
+### 14.3 한 줄 정리
+
+**NUMA·스레드풀** = "CPU KV 작업을 코어 고정 스레드풀로 병렬화하고, `numactl`로 메모리를 로컬 NUMA 노드에 두어 지역성을 확보". Wave Buffer의 CPU 절반이 GPU와 겹쳐 돌아가게 하는 실행 기반입니다.
+
+### 참고문헌
+- 코드: [`library/retroinfer/retroinfer_kernels/src/thread_pool.hpp`](../library/retroinfer/retroinfer_kernels/src/thread_pool.hpp), [`config/config.py`](../config/config.py) (`get_numa_node_core_count`), [`throughput_eval/run_different_lengths.sh`](../throughput_eval/run_different_lengths.sh)
