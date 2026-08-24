@@ -17,6 +17,7 @@
 12. [vLLM (베이스라인)](#12-vllm-베이스라인)
 13. [CUDA Graph](#13-cuda-graph)
 14. [NUMA · 스레드풀](#14-numa--스레드풀)
+15. [NVIDIA A100 (Ampere) 구조](#15-nvidia-a100-ampere-구조)
 
 ---
 
@@ -870,3 +871,79 @@ flowchart LR
 
 ### 참고문헌
 - 코드: [`library/retroinfer/retroinfer_kernels/src/thread_pool.hpp`](../library/retroinfer/retroinfer_kernels/src/thread_pool.hpp), [`config/config.py`](../config/config.py) (`get_numa_node_core_count`), [`throughput_eval/run_different_lengths.sh`](../throughput_eval/run_different_lengths.sh)
+
+---
+
+## 15. NVIDIA A100 (Ampere) 구조
+
+> 발표 자료 연관 슬라이드: **9 (CUTLASS·커널)**, **11 (하드웨어 요구사항)**, **10 (처리량 실험 환경)**
+
+RetroInfer가 검증·최적화된 **레퍼런스 하드웨어**가 A100입니다. "왜 Ampere가 필수인가", "왜 그래도 CPU 오프로드가 필요한가"를 하드웨어 관점에서 설명합니다.
+
+### 15.1 큰 그림 — GPU의 계층 구조
+
+A100은 **GA100** 칩(Ampere 세대, compute capability **sm_80**) 기반입니다. GPU는 다음 계층으로 구성됩니다.
+
+```mermaid
+flowchart TD
+    GPU["A100 GPU (GA100, sm_80)"] --> SMs["108× SM (Streaming Multiprocessor)"]
+    SMs --> SM1["SM 하나"]
+    SM1 --> FP["64× FP32 CUDA 코어"]
+    SM1 --> TC["4× 3세대 Tensor Core"]
+    SM1 --> SMEM["192KB L1/공유 메모리"]
+    GPU --> L2["40MB L2 캐시"]
+    GPU --> HBM["HBM2e 40/80GB (~1.5–2.0 TB/s)"]
+    GPU -. NVLink 3 (600 GB/s) .- OTHER["다른 A100"]
+```
+
+### 15.2 핵심 사양 요약
+
+| 항목 | A100 (40GB / 80GB) | RetroInfer 관련성 |
+|---|---|---|
+| 아키텍처 | Ampere GA100, **sm_80** | 커널이 `Sm80` 타깃 → **필수** |
+| SM 수 | 108 | 병렬 스레드블록 실행 |
+| Tensor Core | **3세대**, 108×4개 | `batch_gemm_softmax`가 사용 |
+| BF16/FP16 성능 | ~312 TFLOPS (희소성 시 624) | 클러스터 검색·어텐션 가속 |
+| HBM 메모리 | 40GB / 80GB, HBM2e | 모델 + KV 작업 버퍼 |
+| HBM 대역폭 | ~1.55 / ~2.0 TB/s | 어텐션은 여전히 대역폭 바운드 |
+| L2 캐시 | 40MB | |
+| L1/공유 메모리 | SM당 최대 192KB | FlashAttention 타일링에 활용 |
+| NVLink | 3세대, 600 GB/s | 72B 모델 멀티 GPU 분산 |
+
+### 15.3 3세대 Tensor Core — 왜 A100 이상인가
+
+A100의 **3세대 Tensor Core**는 이전 세대와 달리 **BF16·TF32를 네이티브 지원**하고, `⟨16,8,16⟩` 형태의 MMA를 제공합니다([4. CUTLASS·Tensor Core](#4-cutlass--tensor-core) 참조).
+
+- RetroInfer의 `batch_gemm_softmax.cu`는 정확히 `ArchTag = Sm80` + `InstructionShape<16,8,16>` + bf16으로 인스턴스화됩니다.
+- Pascal(P6000, sm_61)에는 Tensor Core 자체가 없고, Volta/Turing은 bf16 미지원 → **A100(또는 그 이상)이 사실상 하한선**. (발표 슬라이드 11의 근거)
+
+### 15.4 비동기 복사(cp.async) — Ampere의 파이프라이닝
+
+Ampere는 **`cp.async`**(global→shared 메모리 직접 복사, 레지스터 우회) 명령을 도입했습니다. `batch_gemm_softmax.cu`가 `#include "cutlass/arch/memory_sm80.h"`를 포함하는 이유가 이것으로, CUTLASS가 이 명령으로 **데이터 로드와 연산을 파이프라인**해 Tensor Core를 놀리지 않고 채웁니다.
+
+### 15.5 메모리가 크지만 — 그래도 CPU 오프로드가 필요한 이유
+
+A100 80GB는 크지만, 긴 컨텍스트 KV에는 부족합니다.
+
+- 1M 토큰 KV 캐시(Llama-3-8B, bf16) ≈ 수백 GB → 80GB로 감당 불가.
+- 게다가 모델 가중치(8B×2B=16GB)와 prefill 임시 버퍼도 HBM을 씁니다.
+
+→ 그래서 RetroInfer는 **전체 KV를 CPU(수백 GB)에 두고 A100은 작업 버퍼로만** 씁니다([9. Wave Buffer](#9-wave-buffer--lru-캐시-상세)). A100의 큰 HBM은 "작업 버퍼 + LRU 캐시"를 넉넉히 잡는 데 쓰이고, 근본 용량은 CPU가 담당합니다.
+
+### 15.6 대역폭이 높아도 — 어텐션은 여전히 memory-bound
+
+A100의 ~2TB/s HBM 대역폭도 어텐션의 **전량 KV 접근** 앞에서는 병목이 됩니다([1. FlashAttention](#1-flashattention)). FlashAttention은 IO를 줄이고, RetroInfer는 **접근할 KV 자체를 희소하게** 줄여 이 대역폭 압박을 완화합니다.
+
+### 15.7 멀티 GPU·NUMA — 처리량 실험 환경
+
+- **NVLink 3세대(600 GB/s)**: 72B 모델을 여러 A100에 분산(`--device auto`), GPU 간 activation 전송 가속.
+- 논문 처리량 실험: **Azure 4-NUMA 노드** 머신, NUMA 노드당 **80GB A100 ×2** + 24 CPU 코어 + 475GB CPU 메모리([14. NUMA·스레드풀](#14-numa--스레드풀), `throughput_eval/*.sh`의 `numactl` 바인딩).
+
+### 15.8 한 줄 정리
+
+**A100(Ampere GA100, sm_80)** = "108 SM · 3세대 Tensor Core(bf16, `⟨16,8,16⟩`) · 40/80GB HBM2e(~2TB/s) · `cp.async` · NVLink". RetroInfer는 Tensor Core로 검색·어텐션을 가속하되, 큰 HBM으로도 부족한 긴-컨텍스트 KV는 CPU 오프로드로 확장합니다.
+
+### 참고문헌
+- NVIDIA, *NVIDIA A100 Tensor Core GPU Architecture* 백서 (2020)
+- NVIDIA, *NVIDIA Ampere GA100 GPU Architecture*
+- 코드: [`library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu`](../library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu) (`memory_sm80.h`, `Sm80`), [`throughput_eval/`](../throughput_eval)
