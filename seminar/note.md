@@ -5,6 +5,9 @@
 ## 목차
 1. [FlashAttention](#1-flashattention)
 2. [ANN (근사 최근접 이웃 탐색)](#2-ann-근사-최근접-이웃-탐색)
+3. [online-softmax 병합](#3-online-softmax-병합)
+4. [CUTLASS · Tensor Core](#4-cutlass--tensor-core)
+5. [segmented k-means](#5-segmented-k-means)
 
 ---
 
@@ -223,3 +226,231 @@ KV 캐시를 "벡터 DB"로 보는 순간, 수십 년간 발전한 **벡터 검�
 - Johnson et al., *Billion-scale similarity search with GPUs (Faiss)*, 2017. [arXiv:1702.08734](https://arxiv.org/abs/1702.08734) — IVF/PQ ANN의 대표 구현
 - Liu et al., *RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval*, 2024. [arXiv:2409.10516](https://arxiv.org/abs/2409.10516)
 - 코드: [`cache_hub/kmeans.py`](../cache_hub/kmeans.py), [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py)
+
+---
+
+## 3. online-softmax 병합
+
+> 발표 자료 연관 슬라이드: **5 (3-Zone 어텐션)**, **8 (디코딩 실행 흐름)**
+
+3개의 존(steady·retrieval·estimation)을 각각 따로 계산해 놓고 **하나의 올바른 softmax 결과로 합치는** 수학이 online-softmax 병합입니다. FlashAttention의 온라인 소프트맥스(1.4절)와 같은 원리를, "블록"이 아니라 "존" 단위로 적용한 것입니다.
+
+### 3.1 문제 — 부분 softmax를 어떻게 합치나
+
+softmax 어텐션은 **분모(정규화 상수)가 전체 key에 걸린 합**이라, 일부 key만으로 계산한 결과를 단순히 더하면 틀립니다.
+
+```
+전체:   O = Σ_all e^(sᵢ) vᵢ / Σ_all e^(sᵢ)
+부분 A: O_A = Σ_A e^(sᵢ) vᵢ / Σ_A e^(sᵢ)   ← 분모가 A에만 걸림
+부분 B: O_B = Σ_B ...                        ← 분모가 B에만 걸림
+```
+
+`O_A`와 `O_B`를 정확히 합치려면, 각 부분이 **자기 분모를 얼마나 썼는지**를 기억해야 합니다. 그 값이 **LSE(log-sum-exp)** 입니다.
+
+### 3.2 LSE와 병합 공식
+
+각 부분 계산은 출력 `O`와 함께 `lse = log(Σ e^(sᵢ))` 를 반환합니다(내부적으로는 running max `m`과 sum `ℓ`, `lse = m + log ℓ`). 두 부분 (O_A, lse_A), (O_B, lse_B)를 합치는 공식:
+
+```
+lse   = log(e^(lse_A) + e^(lse_B))                          # 새 정규화 상수(로그)
+w_A   = e^(lse_A − lse),   w_B = e^(lse_B − lse)            # 각 부분의 가중치 (합 = 1)
+O     = w_A · O_A + w_B · O_B                                # 가중 평균
+```
+
+- 실제 구현은 `m = max(lse_A, lse_B)`를 빼고 지수를 취해 **수치 안정화**합니다.
+- 이렇게 합친 `O`는 A∪B 전체로 한 번에 계산한 softmax와 **정확히 동일**합니다(근사 아님). 존을 몇 개로 쪼개 순서를 바꿔도 결과 불변.
+
+### 3.3 RetroInfer에서의 사용 — estimation을 정확 존에 병합
+
+`cache_hub/retroinfer_cache.py`의 `sparse_attention`이 이 병합을 그대로 씁니다.
+
+1. **estimation 존** 먼저 계산 → centroid 근사로 `(es_out, es_lse)` 획득:
+   ```python
+   es_out, es_lse = weighted_flash_decoding(queries, es_centroids, es_value_sum,
+                                             es_cluster_size, return_softmax_lse=True)
+   ```
+2. **retrieval + steady 존**을 계산하면서, 위 estimation 결과를 `previous_out`/`previous_lse`로 넘겨 **한 번에 병합**:
+   ```python
+   attn_out = weighted_flash_decoding(queries, execution_buffer_keys, execution_buffer_values,
+                                      previous_out=es_out, previous_lse=es_lse,   # ← 병합 입력
+                                      cache_seqlens=valid_lengths)
+   ```
+
+즉 `weighted_flash_decoding`(FlashAttention의 weighted 포크)이 커널 내부에서 정확 존을 계산하고, 넘어온 estimation의 `(out, lse)`와 online-softmax로 합쳐 최종 출력을 냅니다. 존을 따로 계산해도 결과는 전량 어텐션에 근접합니다.
+
+```mermaid
+flowchart LR
+    ES["estimation 존<br/>centroid 근사"] -->|es_out, es_lse| M{online-softmax 병합}
+    RS["retrieval + steady 존<br/>정확 어텐션"] --> M
+    M -->|weighted_flash_decoding| O["최종 어텐션 출력"]
+```
+
+### 3.4 왜 중요한가
+
+- **정확도 보장의 수학적 기반**: 3-zone을 "따로 계산 후 정확히 합칠 수 있다"는 보장이 없으면 희소화는 그냥 근사 오류가 됩니다. LSE 병합이 이 정합성을 보장합니다.
+- **estimation을 "버리지 않고 싸게 반영"**: 일반 ANN이 nprobe 밖을 버리는 것과 달리, RetroInfer는 나머지를 centroid로 근사해 **분모에 기여**시킵니다 → recall 손실을 오차 경계 안으로.
+
+### 3.5 한 줄 정리
+
+**online-softmax 병합** = "부분별로 계산한 softmax 어텐션을 각자의 LSE(log-sum-exp)로 가중해 정확히 하나로 합치는 기법." RetroInfer는 이를 통해 estimation 존과 정확 존(retrieval+steady)을 손실 없이 결합합니다.
+
+### 참고문헌
+- Rabe & Staats, *Self-attention Does Not Need O(n²) Memory*, 2021. [arXiv:2112.05682](https://arxiv.org/abs/2112.05682) — 온라인 누적 어텐션
+- Dao et al., *FlashAttention*, 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
+- 코드: [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`sparse_attention`)
+
+---
+
+## 4. CUTLASS · Tensor Core
+
+> 발표 자료 연관 슬라이드: **9 (고성능 커널)**, **11 (하드웨어 요구사항)**
+
+RetroInfer의 클러스터 검색(`Q·Cᵀ` + softmax)을 GPU에서 최고 속도로 돌리는 하드웨어·소프트웨어 축입니다.
+
+### 4.1 Tensor Core — 행렬곱 전용 하드웨어
+
+**Tensor Core**는 NVIDIA GPU(Volta 이후)에 탑재된, **작은 행렬의 곱셈-누적(MMA, Matrix-Multiply-Accumulate)을 한 명령으로** 처리하는 특수 연산 유닛입니다.
+
+- 일반 CUDA core가 스칼라 곱셈을 하나씩 하는 반면, Tensor Core는 `D = A·B + C`를 **타일 단위로 한 번에** 수행 → 딥러닝의 GEMM/어텐션에서 수 배~수십 배 처리량.
+- **MMA 명령의 형태(InstructionShape)** 가 세대별로 정해져 있습니다. RetroInfer가 쓰는 `⟨16, 8, 16⟩`(M=16, N=8, K=16)은 **Ampere(sm_80)** 의 형태입니다.
+- 입력은 저정밀(**bf16 / fp16**), 누적은 fp32로 하여 속도와 정확도를 동시에 확보.
+
+| 세대 | 아키텍처 | Tensor Core | bf16 |
+|---|---|---|---|
+| sm_61 | Pascal (P6000) | ❌ 없음 | ❌ |
+| sm_70 | Volta | 1세대 | ❌ |
+| sm_75 | Turing | 2세대 | ❌ |
+| **sm_80** | **Ampere (A100)** | **3세대** | ✅ |
+| sm_90 | Hopper (H100) | 4세대 | ✅ |
+
+→ 발표 슬라이드 11의 "Ampere 이상 필요, Pascal 불가"는 바로 이 `⟨16,8,16⟩`·`Sm80` 하드코딩에서 나옵니다.
+
+### 4.2 CUTLASS — Tensor Core GEMM을 조립하는 템플릿 라이브러리
+
+Tensor Core를 직접 다루는 것은 매우 복잡합니다(메모리 계층, 타일링, 파이프라인, 동기화). **CUTLASS**(CUDA Templates for Linear Algebra Subroutines)는 NVIDIA가 제공하는 C++ 템플릿 라이브러리로, 이 복잡성을 조립식으로 캡슐화합니다.
+
+핵심 개념 **epilogue fusion**: GEMM 결과를 전역 메모리에 썼다가 다시 읽지 않고, **연산 직후 후처리(스케일·softmax 부분합 등)를 융합**해 메모리 왕복을 없앱니다.
+
+### 4.3 RetroInfer에서의 사용 — 융합 GEMM + Softmax
+
+`library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu`(+ `.h`)가 CUTLASS로 **`Softmax(Q·Cᵀ)`를 한 커널에 융합**합니다.
+
+```cpp
+using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;   // Ampere MMA
+using OperatorClass     = cutlass::arch::OpClassTensorOp;        // Tensor Core 사용
+using ArchTag           = cutlass::arch::Sm80;                   // Ampere 타깃
+using ThreadblockShape  = cutlass::gemm::GemmShape<32, 256, 32>; // 스레드블록 타일
+using WarpShape         = cutlass::gemm::GemmShape<32, 64, 32>;  // 워프 타일
+```
+
+- **타일링 계층**: Threadblock → Warp → Instruction 3단계로 문제를 쪼개 SM을 채웁니다.
+- **epilogue visitor**(`batch_gemm_with_epilogue_visitor.h`): GEMM 결과가 나오는 즉시 행별 max·부분합을 계산 → 2단계 online-softmax로 정규화. Q·Cᵀ 행렬을 따로 저장하지 않음.
+- 입력 dtype에 따라 `bfloat16_t` / `half_t`로 인스턴스화.
+
+이 커널이 `retroinfer_cache.sparse_attention`의 첫 단계(클러스터 관련도 `dist` 계산)를 담당합니다 → ANN의 "coarse search"를 Tensor Core로 가속.
+
+```mermaid
+flowchart LR
+    Q["Q (query)"] --> G["CUTLASS GEMM<br/>Tensor Core ⟨16,8,16⟩"]
+    C["Cᵀ (centroids)"] --> G
+    G --> EV["epilogue: max·부분합 융합"]
+    EV --> FR["최종 축약(정규화)"]
+    FR --> S["Softmax(Q·Cᵀ) = dist"]
+```
+
+### 4.4 한 줄 정리
+
+**Tensor Core** = 행렬곱-누적 전용 하드웨어(Ampere는 `⟨16,8,16⟩`, bf16), **CUTLASS** = 그 위에 GEMM을 조립하고 후처리를 융합하는 템플릿 라이브러리. RetroInfer는 둘을 써서 `Softmax(Q·Cᵀ)`를 융합 커널로 가속하며, 이 때문에 **Ampere 이상 GPU가 필수**가 됩니다.
+
+### 참고문헌
+- NVIDIA, *CUTLASS* — [github.com/NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
+- NVIDIA, *Ampere Architecture (A100) Whitepaper* — Tensor Core 3세대·bf16
+- 코드: [`library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu`](../library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu), [`batch_gemm_softmax.h`](../library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.h)
+
+---
+
+## 5. segmented k-means
+
+> 발표 자료 연관 슬라이드: **6 (Wave Index)**
+
+RetroInfer의 **wave index(벡터 인덱스)를 구축하는 클러스터링 알고리즘**입니다. 표준 k-means에 "세그먼트 분할"을 더해, 긴 컨텍스트에서도 저비용으로 인덱스를 만듭니다.
+
+### 5.1 k-means 복습
+
+k-means는 데이터를 k개 클러스터로 나누는 반복 알고리즘:
+
+1. **초기화**: centroid k개 선택
+2. **할당(assign)**: 각 점을 가장 가까운 centroid에 배정
+3. **갱신(update)**: 각 클러스터의 평균으로 centroid 재계산
+4. 2~3을 수렴할 때까지 반복
+
+RetroInfer에서 "점"은 **Key 벡터**, "centroid"는 wave index의 인덱스 엔트리가 됩니다.
+
+### 5.2 "segmented"의 핵심 — 공간적 지역성 활용
+
+긴 시퀀스 전체를 한 번에 k-means 하면 비쌉니다. RetroInfer의 통찰: **어텐션은 인접 토큰이 비슷한 패턴**을 보인다(coarse-grained spatial locality). 그래서:
+
+- 시퀀스를 `n_segments`개 세그먼트로 나눔 (`n_segments = max(round(context_len/8192), 1)`)
+- **세그먼트별로 독립 k-means** 수행 → 각 세그먼트가 자기 부분 클러스터를 가짐
+- 세그먼트끼리 병렬 처리 가능, 각 k-means의 데이터 크기가 작아 **구축 비용·오버헤드 감소**
+
+이것이 "저오버헤드 인덱스 구축"(발표 슬라이드 6)의 실체입니다.
+
+### 5.3 구현 — 전부 Triton 커널
+
+`cache_hub/kmeans.py`의 `segment_k_means`가 오케스트레이션하며, 내부는 Triton GPU 커널입니다.
+
+| 커널/함수 | 역할 |
+|---|---|
+| `_triton_assign_kernel` | 각 토큰을 최근접 centroid에 할당(내적 최대), 클러스터 합·카운트 원자적 누적 |
+| `_triton_update_kernel` | 합/카운트로 centroid 갱신(평균), 옵션 정규화 |
+| `_triton_k_means_train` | assign→update 1 iteration |
+| `triton_reverse_index` | max_idx로부터 클러스터별 소속 토큰 목록(역인덱스)·크기 생성 |
+| `triton_index_add` | 클러스터별 Value 벡터 합(`value_sum`) 계산 |
+
+**흐름**: centroid 균등 초기화 → 세그먼트 단위로 `num_iters-1`회 학습 → 전체 대상 최종 1회 학습(인덱스 확정) → `value_sum`·역인덱스 생성.
+
+**산출물** (= wave index):
+- `centroids` — 클러스터 대표 벡터 (검색 대상)
+- `value_sum` — 클러스터별 V 합 (estimation 존의 근사에 사용)
+- `clusters` — 클러스터별 소속 토큰 id (retrieval 존이 실제 KV를 gather할 때)
+- `cluster_size` — 클러스터 크기
+
+### 5.4 커널 제약 — 왜 클러스터 수가 특정 배수여야 하나
+
+`config/config.py`가 클러스터 수를 **lcm(8, n_segment)의 배수**로 반올림합니다:
+
+```python
+n_factor = math.lcm(8, n_segments)
+# n_clusters를 n_factor의 배수로 보정
+```
+
+그리고 `retroinfer_cache.py`에 `assert n_centroids % lcm(8, n_segment) == 0`가 있습니다. 이유:
+- Tensor Core/커널 타일링이 **8의 배수 정렬**을 요구(4.1절 `⟨16,8,16⟩`),
+- 세그먼트별로 클러스터가 **균등 분할**되어야 하므로 `n_segment`로도 나누어떨어져야 함.
+
+### 5.5 동적 갱신
+
+정적 벡터 DB와 달리 KV는 디코딩 중 계속 늘어납니다. RetroInfer는 일정 주기(`UPDATE_SEGMENT=1024` 토큰)마다 새 토큰들에 대해 **증분 클러스터링**을 수행하고(`nprobe_new`, `WaveBufferCPU.update_kv`), 인덱스에 이어 붙입니다.
+
+```mermaid
+flowchart LR
+    K["Key 벡터<br/>(긴 시퀀스)"] --> Seg["n_segments개로 분할"]
+    Seg --> KM["세그먼트별 k-means<br/>(Triton, 병렬)"]
+    KM --> Cen["centroids"]
+    KM --> RI["clusters / cluster_size"]
+    V["Value 벡터"] --> VS["value_sum (클러스터별 합)"]
+    KM --> VS
+    Cen --> IDX["wave index"]
+    RI --> IDX
+    VS --> IDX
+```
+
+### 5.6 한 줄 정리
+
+**segmented k-means** = "시퀀스를 세그먼트로 나눠 각각 k-means 하여, 어텐션의 공간적 지역성을 활용해 **저비용으로 wave index를 구축**하는 방법." 산출된 centroids·value_sum·clusters가 각각 검색·estimation·retrieval의 재료가 됩니다.
+
+### 참고문헌
+- Lloyd, *Least squares quantization in PCM*, 1982 — k-means의 고전
+- Tillet et al., *Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations*, 2019
+- 코드: [`cache_hub/kmeans.py`](../cache_hub/kmeans.py), [`config/config.py`](../config/config.py) (클러스터 수 보정)
