@@ -4,6 +4,7 @@
 
 ## 목차
 1. [FlashAttention](#1-flashattention)
+2. [ANN (근사 최근접 이웃 탐색)](#2-ann-근사-최근접-이웃-탐색)
 
 ---
 
@@ -130,3 +131,95 @@ RetroInfer는 여기서 한 걸음 더 나갑니다 — **어텐션의 희소성
 - Dao et al., *FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness*, NeurIPS 2022. [arXiv:2205.14135](https://arxiv.org/abs/2205.14135)
 - Dao, *FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning*, 2023. [arXiv:2307.08691](https://arxiv.org/abs/2307.08691)
 - 코드: [`attn_hub/full_attn.py`](../attn_hub/full_attn.py), [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py)
+
+---
+
+## 2. ANN (근사 최근접 이웃 탐색)
+
+> 발표 자료 연관 슬라이드: **3 (핵심 통찰)**, **6 (Wave Index)**
+
+**ANN = Approximate Nearest Neighbor search (근사 최근접 이웃 탐색)**. RetroInfer의 "KV 캐시를 벡터 저장 시스템으로 다룬다"는 발상의 이론적 뿌리입니다.
+
+### 2.1 왜 어텐션이 ANN 문제인가
+
+디코딩 한 스텝에서 어텐션이 하는 일을 다시 보면:
+
+```
+S = q · Kᵀ / √d      # 현재 query q(1개)와 모든 key의 내적
+P = softmax(S)        # 큰 점수일수록 큰 가중치
+O = P · V             # 가중합
+```
+
+softmax는 **점수가 큰 소수의 key에 가중치를 몰아줍니다**(지수 함수의 성질). 즉 출력 O에 실질적으로 기여하는 것은 `q`와 내적이 큰 = **q에 가장 가까운(방향이 비슷한) 소수의 key** 뿐입니다.
+
+> "query와 내적이 큰 상위 몇 개의 벡터를 찾아라" — 이것이 정확히 **최근접 이웃 탐색(NN search)** 의 정의입니다. (내적/코사인 유사도 기준의 Maximum Inner Product Search, MIPS)
+
+그런데 정확한 NN(모든 key와 내적)을 매번 하면 결국 전량 어텐션과 같아집니다. 그래서 **근사(Approximate)** 를 씁니다 — 약간의 누락을 감수하고 훨씬 빠르게 "충분히 좋은" 상위 후보를 찾습니다. 이것이 ANN입니다.
+
+### 2.2 정확 NN vs 근사 ANN — 재현율/지연 트레이드오프
+
+| | 정확 NN (brute force) | 근사 ANN |
+|---|---|---|
+| 방식 | 모든 벡터와 거리 계산 | 인덱스로 후보만 계산 |
+| 비용 | O(N) — 느림 | O(N보다 훨씬 작음) — 빠름 |
+| 정확도 | 100% | **재현율(recall) < 100%** (일부 진짜 이웃 누락 가능) |
+
+ANN의 핵심 지표는 **재현율(recall)** = "진짜 상위 k개 중 몇 개를 실제로 찾았나". 인덱스를 더 많이 탐색할수록 recall↑·지연↑. 시스템은 이 **재현율 ↔ 지연 트레이드오프**를 조절합니다. RetroInfer에서는 `retrieval_budget`이 바로 이 조절 손잡이입니다.
+
+### 2.3 대표적 ANN 인덱스 방식
+
+| 방식 | 아이디어 | RetroInfer 관련성 |
+|---|---|---|
+| **IVF (Inverted File)** | 벡터를 클러스터로 나누고, query와 가까운 몇 개 클러스터(nprobe)만 탐색 | ✅ **RetroInfer의 wave index가 이 방식** |
+| HNSW (그래프) | 이웃 그래프를 따라 탐색 | 그래프 유지 비용이 커 동적 KV에 부적합 |
+| PQ (Product Quantization) | 벡터를 압축해 근사 거리 계산 | 메모리 절약형, RetroInfer의 estimation과 발상 유사 |
+
+RetroInfer는 **IVF(Inverted File Index)** 계열을 채택합니다. 긴 컨텍스트에서 매 스텝 인덱스를 쓰고 갱신해야 하므로, 구축·갱신이 저렴한 클러스터링 기반이 적합하기 때문입니다.
+
+### 2.4 IVF 흐름과 RetroInfer의 wave index 대응
+
+일반적인 IVF-ANN의 3단계와 RetroInfer 구현이 정확히 대응됩니다.
+
+```mermaid
+flowchart LR
+    subgraph IVF[일반 IVF-ANN]
+      C1[1. 클러스터링<br/>k-means로 centroid 생성]
+      C2[2. 탐색<br/>query·centroid 상위 nprobe]
+      C3[3. 정밀 계산<br/>선택 클러스터 내 벡터만]
+    end
+    C1 --> C2 --> C3
+```
+
+| IVF 단계 | RetroInfer 구현 | 코드 |
+|---|---|---|
+| ① 클러스터링(색인 구축) | segmented k-means로 KV를 클러스터화, centroid 생성 | `cache_hub/kmeans.py`의 `segment_k_means` |
+| ② 탐색(coarse search) | `Softmax(Q·Cᵀ)` → top-k 클러스터 선택 | `batch_gemm_softmax` + `topk` |
+| ③ 정밀 계산 | 선택 클러스터의 실제 KV로 어텐션 | `weighted_flash_decoding` |
+
+- **centroid** = 클러스터 대표 벡터 = IVF의 "coarse quantizer" 엔트리.
+- **nprobe** = 탐색할 클러스터 수 = `⌈n_centroids × retrieval_budget⌉` (발표 슬라이드 6).
+
+### 2.5 RetroInfer가 일반 ANN과 다른 점
+
+RetroInfer의 wave index는 표준 IVF를 그대로 쓰지 않고 **어텐션에 특화**했습니다. 그래서 이름도 "**A**ttention-a**W**are **VE**ctor index".
+
+1. **어텐션 인식(Attention-aware)**: 거리(L2)가 아니라 어텐션 점수(내적+softmax)를 직접 기준으로 클러스터를 선택합니다.
+2. **정확도 보장(Accuracy-bounded)**: 일반 ANN은 nprobe 밖 클러스터를 그냥 버려 recall이 떨어집니다. RetroInfer는 **estimation 존**으로 나머지 클러스터를 centroid로 *근사 추정*해 합칩니다 → 누락으로 인한 오차에 경계를 둡니다(발표 슬라이드 5). 즉 "버리는" 대신 "싸게 근사"합니다.
+3. **동적 갱신**: 디코딩 중 새 토큰이 생기면 인덱스를 증분 갱신합니다(`nprobe_new`, `update_kv`). 정적 벡터 DB용 ANN과 달리 KV는 계속 늘어나기 때문입니다.
+4. **공간적 지역성 활용**: 어텐션은 인접 토큰이 비슷한 패턴을 보이므로, **segmented** k-means로 세그먼트별 클러스터링해 구축 비용을 낮춥니다.
+
+### 2.6 왜 이 관점이 강력한가
+
+KV 캐시를 "벡터 DB"로 보는 순간, 수십 년간 발전한 **벡터 검색(vector search) 기술**을 LLM 추론에 그대로 이식할 수 있습니다. RetroInfer라는 이름의 다른 축(`RetrievalAttention`)이 바로 이 지점 — "어텐션을 **검색(retrieval)** 문제로 환원"하는 것입니다.
+
+- 정확 어텐션(FlashAttention): 모든 key를 본다 → O(N)
+- ANN 관점(RetroInfer): 관련 key만 검색한다 → O(budget × N), recall은 estimation으로 보정
+
+### 2.7 한 줄 정리
+
+**ANN** = "정확한 최근접 이웃을 약간의 누락을 감수하고 훨씬 빠르게 찾는 검색." 어텐션은 본질적으로 "query에 가까운 key 찾기"라는 ANN 문제이고, RetroInfer는 이를 **IVF 방식의 wave index + 정확도 보장 estimation**으로 구현해, 긴 컨텍스트에서 계산량을 budget 비율만큼으로 줄입니다.
+
+### 참고문헌
+- Johnson et al., *Billion-scale similarity search with GPUs (Faiss)*, 2017. [arXiv:1702.08734](https://arxiv.org/abs/1702.08734) — IVF/PQ ANN의 대표 구현
+- Liu et al., *RetrievalAttention: Accelerating Long-Context LLM Inference via Vector Retrieval*, 2024. [arXiv:2409.10516](https://arxiv.org/abs/2409.10516)
+- 코드: [`cache_hub/kmeans.py`](../cache_hub/kmeans.py), [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py)
