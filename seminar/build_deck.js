@@ -359,7 +359,50 @@ s.addText("→  결과를 다음 레이어로 전달, 매 디코딩 스텝 반�
 footer(s); pageNum(s, 8);
 
 // =========================================================
-// Slide 9 — CUDA kernels (light)
+// Slide 9 — RetroInfer algorithm pseudocode (light)
+// =========================================================
+s = p.addSlide();
+s.background = { color: WHITE };
+title(s, "RetroInfer 알고리즘 (의사코드)", "Prefill에서 wave index 구축 → Decode 매 스텝 3-zone 희소 어텐션");
+colHead(s, 0.6, 1.95, 6.0, "① Prefill — 인덱스 구축", "0F766E");
+codeBox(s, 0.6, 2.35, 6.0, 2.55,
+  "for layer in layers:\n" +
+  "  Q,K,V = QKV_proj(h)      # RoPE 적용\n" +
+  "  O = prefill_attn(Q,K,V)  # full/xattn/minfer\n\n" +
+  "  # --- wave index 구축 ---\n" +
+  "  centroids, value_sum,\n" +
+  "  clusters, cluster_size =\n" +
+  "    segment_k_means(K, V, n_centroids)\n" +
+  "  WaveBufferCPU.async_construction(\n" +
+  "    clusters, cluster_size)   # CPU IVF", 10);
+s.addShape(p.ShapeType.roundRect, { x: 0.6, y: 5.05, w: 6.0, h: 1.3, rectRadius: 0.08, fill: { color: CARD }, line: { color: LINE, width: 1 } });
+s.addText("3-Zone 요약", { x: 0.8, y: 5.13, w: 5.6, h: 0.32, fontFace: FB, fontSize: 13, bold: true, color: TEXT, margin: 0 });
+const zleg = [["steady","8B5CF6","고정 토큰(싱크+최근) → 정확"],["retrieval",TEAL,"nprobe 클러스터 → 정확"],["estimation",AMBER,"나머지 → centroid 근사"]];
+zleg.forEach((z,i)=>{ const zy=5.5+i*0.28; s.addShape(p.ShapeType.ellipse,{x:0.86,y:zy+0.02,w:0.15,h:0.15,fill:{color:z[1]}}); s.addText([{text:z[0]+"  ",options:{bold:true,color:z[1]==AMBER?"B45309":(z[1]==TEAL?"0F766E":"6D28D9")}},{text:z[2],options:{color:"334155"}}],{x:1.12,y:zy-0.05,w:5.35,h:0.3,fontFace:F,fontSize:11,margin:0}); });
+colHead(s, 6.9, 1.95, 5.8, "② Decode — sparse_attention(q)", NAVY);
+codeBox(s, 6.9, 2.35, 5.8, 4.4,
+  "dist = softmax(q · centroidsᵀ)   # ① 검색\n" +
+  "top  = topk(dist, nprobe + es)\n\n" +
+  "# ② estimation (근사)\n" +
+  "es_out, es_lse = weighted_flash_decoding(\n" +
+  "    q, es_centroids, es_value_sum,\n" +
+  "    return_softmax_lse=True)\n\n" +
+  "# ③ wave buffer 접근 (hit / miss)\n" +
+  "WaveBuffer.batch_access(top[:nprobe])\n\n" +
+  "# ④ steady + retrieval 조립\n" +
+  "gather_copy_and_concat(-> execution_buffer)\n\n" +
+  "# ⑤ 정확 어텐션 + estimation 병합\n" +
+  "out = weighted_flash_decoding(\n" +
+  "    q, buf_K, buf_V,\n" +
+  "    previous_out=es_out,\n" +
+  "    previous_lse=es_lse)   # online-softmax\n\n" +
+  "# ⑥ 사용 페이지 LRU admit\n" +
+  "gather_copy_and_scatter(...)", 9.5);
+footer(s); pageNum(s, 9);
+
+
+// =========================================================
+// Slide 10 — CUDA kernels (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -391,10 +434,10 @@ ks.forEach((k, i) => {
   const items = k[3].map((t, idx) => ({ text: t, options: { bullet: { code: "2022", indent: 12 }, breakLine: idx < k[3].length - 1, paraSpaceAfter: 8 } }));
   s.addText(items, { x: cx + 0.3, y: 3.1, w: 3.3, h: 2.9, fontFace: F, fontSize: 12, color: "1E293B", lineSpacingMultiple: 1.05, margin: 0, valign: "top" });
 });
-footer(s); pageNum(s, 9);
+footer(s); pageNum(s, 10);
 
 // =========================================================
-// Slide 10 — Results (light + chart)
+// Slide 11 — Results (light + chart)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -429,10 +472,10 @@ s.addText("정확도 검증", { x: 8.25, y: 4.25, w: 4.2, h: 0.4, fontFace: FB, 
 const acc = ["RULER (128K) — NIAH·VT·CWE·FWE·QA", "LongBench — SQA·MQA·요약·코드", "AIME / GPQA 장문 추론"];
 s.addText(acc.map((t, i) => ({ text: t, options: { bullet: { code: "2022", indent: 12 }, breakLine: i < acc.length - 1, paraSpaceAfter: 8 } })),
   { x: 8.35, y: 4.7, w: 4.1, h: 1.35, fontFace: F, fontSize: 12, color: "1E293B", margin: 0, valign: "top" });
-footer(s); pageNum(s, 10);
+footer(s); pageNum(s, 11);
 
 // =========================================================
-// Slide 11 — Requirements & limits (light)
+// Slide 12 — Requirements & limits (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -466,7 +509,7 @@ lims.forEach((r) => {
   s.addText(r[1], { x: 7.15, y: y + 0.5, w: 5.35, h: 0.6, fontFace: F, fontSize: 11.5, color: "5B4322", lineSpacingMultiple: 1.05, margin: 0 });
   y += 1.28;
 });
-footer(s); pageNum(s, 11);
+footer(s); pageNum(s, 12);
 
 // ---- code box helper ----
 function codeBox(s, x, y, w, h, text, fs) {
@@ -478,7 +521,7 @@ function colHead(s, x, y, w, t, col) {
 }
 
 // =========================================================
-// Slide 12 — NVIDIA A100 (Ampere) 구조 (light)
+// Slide 13 — NVIDIA A100 (Ampere) 구조 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -529,10 +572,10 @@ const a100link = [
 ];
 s.addText(a100link.map((t, i) => ({ text: t, options: { bullet: { code: "2022", indent: 12 }, breakLine: i < a100link.length - 1, paraSpaceAfter: 5 } })),
   { x: 7.4, y: 5.3, w: 5.15, h: 0.95, fontFace: F, fontSize: 11, color: "134E4A", lineSpacingMultiple: 1.05, margin: 0, valign: "top" });
-footer(s); pageNum(s, 12);
+footer(s); pageNum(s, 13);
 
 // =========================================================
-// Slide 13 — 실전 ① 환경 설정 & 커널 설치 (light)
+// Slide 14 — 실전 ① 환경 설정 & 커널 설치 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -567,10 +610,10 @@ s.addText([
   { text: "TIP  ", options: { bold: true, color: "92400E" } },
   { text: "CUDA 12.4 미설치 시 도커 이미지 사용: nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04", options: { color: "5B4322" } },
 ], { x: 0.85, y: 5.7, w: 11.6, h: 0.62, valign: "middle", fontFace: F, fontSize: 12, margin: 0 });
-footer(s); pageNum(s, 13);
+footer(s); pageNum(s, 14);
 
 // =========================================================
-// Slide 14 — 실전 ② 데모 실행 & API (light)
+// Slide 15 — 실전 ② 데모 실행 & API (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -613,10 +656,10 @@ codeBox(s, 6.9, 2.35, 5.8, 3.95,
   "    attention_type=attn_type,\n" +
   "    inputs_ids=input_ids, ...,\n" +
   "    attn_config=attn_config)", 10.5);
-footer(s); pageNum(s, 14);
+footer(s); pageNum(s, 15);
 
 // =========================================================
-// Slide 15 — 실전 ③ 정확도 벤치마크 (light)
+// Slide 16 — 실전 ③ 정확도 벤치마크 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -638,10 +681,10 @@ bms.forEach((b, i) => {
   codeBox(s, cx + 0.22, y = 2.75, 3.4, 1.95, b[2], 9);
   s.addText(b[3], { x: cx + 0.25, y: 4.85, w: 3.4, h: 1.3, fontFace: F, fontSize: 11, color: "334155", lineSpacingMultiple: 1.1, margin: 0 });
 });
-footer(s); pageNum(s, 15);
+footer(s); pageNum(s, 16);
 
 // =========================================================
-// Slide 16 — 실전 ④ 처리량 재현 & 확장 (light)
+// Slide 17 — 실전 ④ 처리량 재현 & 확장 (light)
 // =========================================================
 s = p.addSlide();
 s.background = { color: WHITE };
@@ -673,10 +716,10 @@ ext.forEach((e, i) => {
   ], { x: 7.5, y: y + 0.02, w: 5.2, h: 0.5, fontSize: 11.5, lineSpacingMultiple: 1.0, margin: 0, valign: "middle" });
   y += 0.78;
 });
-footer(s); pageNum(s, 16);
+footer(s); pageNum(s, 17);
 
 // =========================================================
-// Slide 17 — Summary (dark)
+// Slide 18 — Summary (dark)
 // =========================================================
 s = p.addSlide();
 s.background = { color: INK };
@@ -700,7 +743,7 @@ s.addText([
   { text: "참고문헌   ", options: { bold: true, color: TEAL } },
   { text: "RetroInfer (VLDB 2026, arXiv:2505.02922)  ·  RetrievalAttention (arXiv:2409.10516)", options: { color: "8AA0C8" } },
 ], { x: 0.6, y: 6.35, w: 12.1, h: 0.4, fontFace: F, fontSize: 12, margin: 0 });
-pageNum(s, 17, true);
+pageNum(s, 18, true);
 
 p.writeFile({ fileName: "RetroInfer_세미나.pptx" })
   .then(f => console.log("WROTE", f))
