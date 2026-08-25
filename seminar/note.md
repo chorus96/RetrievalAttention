@@ -19,6 +19,7 @@
 14. [NUMA · 스레드풀](#14-numa--스레드풀)
 15. [NVIDIA A100 (Ampere) 구조](#15-nvidia-a100-ampere-구조)
 16. [RetroInfer 알고리즘 총정리 (End-to-End)](#16-retroinfer-알고리즘-총정리-end-to-end)
+17. [심화: estimation 오차 경계 & weighted_flash_decoding 내부](#17-심화-estimation-오차-경계--weighted_flash_decoding-내부)
 
 ---
 
@@ -1089,3 +1090,127 @@ RetroInfer 알고리즘 = **"Prefill에서 K를 클러스터링해 wave index를
 ### 참고문헌
 - Chen et al., *RetroInfer: A Vector Storage Engine for Scalable Long-Context LLM Inference*, VLDB 2026. [arXiv:2505.02922](https://arxiv.org/abs/2505.02922)
 - 코드: [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`sparse_attention`, `prepare_cache`, `decode_update_kv_cache`), [`model_hub/LLM.py`](../model_hub/LLM.py) (`layer_prefill`, `layer_decode`)
+
+---
+
+## 17. 심화: estimation 오차 경계 & weighted_flash_decoding 내부
+
+> 앞선 [3. online-softmax 병합](#3-online-softmax-병합)·[10. 3-Zone accuracy bound](#10-3-zone-세부-accuracy-bound)의 "estimation이 오차를 경계짓는다"를 **수식으로 유도**하고, 그 계산을 담당하는 `weighted_flash_decoding`의 **내부 동작**을 파고듭니다.
+>
+> ⚠️ 정직성 노트: `weighted_flash_decoding`은 별도 포크([Starmys/flash-attention@weighted](https://github.com/Starmys/flash-attention))의 CUDA 커널로 **이 저장소에는 소스가 없습니다.** 아래 내부 설명은 RetroInfer의 **호출부(call site)** 와 표준 flash-decoding + 가중(weighted) 소프트맥스 수학으로부터 재구성한 것이며, 오차 경계는 논문의 정리를 그대로 옮긴 것이 아니라 **동일 취지의 직관적 유도**입니다.
+
+### 17.1 기호 정리
+
+디코딩 1스텝, 한 (그룹, 헤드)에 대해:
+- query `q ∈ ℝ^d`, key `kᵢ`, value `vᵢ`, 점수 `sᵢ = q·kᵢ / √d`
+- 토큰 집합을 세 존으로 분할: **S**(steady) ∪ **R**(retrieval) ∪ **E**(estimation)
+- S∪R은 정확 계산, E는 클러스터 근사. E의 클러스터 `c`: 중심 `μ_c`, 크기 `n_c`, 값 합 `V_c = Σ_{i∈c} vᵢ`, 중심 점수 `s_c = q·μ_c / √d`
+
+정확한 어텐션 출력:
+
+```
+O* = ( Σ_i e^{sᵢ} vᵢ ) / ( Σ_i e^{sᵢ} )        # i ∈ S∪R∪E
+```
+
+### 17.2 weighted_flash_decoding — 인터페이스 (호출부에서 확정)
+
+`cache_hub/retroinfer_cache.py`는 이 커널을 **세 방식**으로 호출합니다.
+
+| 호출 | keys | values | weight | 용도 |
+|---|---|---|---|---|
+| `dense_attention` | `steady_zone_keys` | `steady_zone_values` | (없음=1) | 짧은 컨텍스트 폴백 |
+| estimation | `es_centroids` (μ_c) | `es_value_sum` (V_c) | `es_cluster_size` (n_c) | E 존 근사 |
+| retrieval+병합 | `execution_buffer_keys` | `execution_buffer_values` | (없음=1) | S+R 정확, E 병합 |
+
+핵심 인자:
+- **weight(4번째 위치 인자)**: 주어지면 각 key의 소프트맥스 기여를 그 값만큼 **가중**. estimation은 `n_c`를 넘김 → 이것이 "weighted"의 의미.
+- **`previous_out` / `previous_lse`**: 이전 부분 결과 `(out, lse)`를 누산기 초기값으로 받아 **online-softmax로 병합**([3절](#3-online-softmax-병합)). retrieval 호출이 estimation의 `(es_out, es_lse)`를 여기에 넣어 세 존을 합침.
+- **`return_softmax_lse`**: `True`면 `(out, lse)` 반환(나중 병합용), `False`면 정규화된 `out`만.
+- **`cache_seqlens`**: 그룹별 유효 길이(실행 버퍼는 가변 길이).
+
+### 17.3 내부 동작 — 가중 online softmax
+
+표준 flash-decoding은 key 하나가 분모에 `e^{s}`, 분자에 `e^{s}·v`를 기여합니다. **가중 버전**은 스칼라 weight `w`를 붙여, 블록을 순회하며 running max `m`으로 안정화한 채 다음을 누산합니다.
+
+```
+# 각 key (kⱼ, vⱼ, 가중치 wⱼ) 를 순회
+m_new = max(m, sⱼ)
+α     = e^{m - m_new}                 # 이전 누산 재스케일 계수
+ℓ    ← α·ℓ + wⱼ · e^{sⱼ - m_new}      # 분모: 가중치가 곱해짐
+O    ← α·O + e^{sⱼ - m_new} · vⱼ      # 분자
+m     = m_new
+# 최종
+out = O / ℓ ,   lse = m + log(ℓ)
+```
+
+- **weight가 분모에만 곱해지는가?** estimation에서는 key=μ_c, value=V_c(=Σvᵢ, 이미 합), weight=n_c. 위 식에 대입하면 클러스터 `c`의 기여는:
+  - 분모: `n_c · e^{s_c}`
+  - 분자: `e^{s_c} · V_c`
+  
+  이는 정확히 아래 17.4의 "클러스터 평균 근사"와 일치합니다. (표준 호출은 `w=1`, `value=vᵢ`라 원래 flash-decoding으로 환원.)
+- **previous_out/lse 병합**: 커널은 `m, ℓ, O`를 `previous_lse`(=이전 `m+logℓ`)와 `previous_out`으로 초기화한 뒤 새 key들을 누산 → 두 존이 정확히 합쳐짐(3절의 LSE 병합과 동일).
+
+### 17.4 estimation의 근사 — 무엇을 가정하나
+
+E 존의 각 클러스터에서 **모든 토큰의 점수를 중심 점수로 대체**합니다: `sᵢ ≈ s_c` (i∈c). 그러면:
+
+```
+분모  Σ_{i∈c} e^{sᵢ}      ≈ n_c · e^{s_c}          # ← weight n_c
+분자  Σ_{i∈c} e^{sᵢ} vᵢ   ≈ e^{s_c} · Σ_{i∈c} vᵢ = e^{s_c} · V_c
+```
+
+바로 이 때문에 커널에 `centroids(μ_c)`, `value_sum(V_c)`, `cluster_size(n_c)` 세 가지가 필요합니다. **버리지 않고 분모·분자에 근사 기여**시키는 것이 핵심 — 일반 ANN이 nprobe 밖을 버려 recall을 잃는 것과 다른 점입니다.
+
+### 17.5 오차 경계 유도
+
+**(a) 클러스터 내부 편차 경계.** k-means는 클러스터 내 분산을 최소화하므로, 반경 `r_c = max_{i∈c} ||kᵢ − μ_c||`가 작습니다. 코시-슈바르츠로 점수 편차를 경계:
+
+```
+|sᵢ − s_c| = |q·(kᵢ − μ_c)| / √d ≤ (||q||·||kᵢ − μ_c||)/√d ≤ (||q||·r_c)/√d =: δ_c
+```
+
+따라서 각 토큰의 지수항은 곱셈 오차 `e^{±δ_c}` 안에 갇힙니다:
+
+```
+e^{sᵢ} ∈ [ e^{s_c}·e^{-δ_c},  e^{s_c}·e^{+δ_c} ]
+⇒ 클러스터 c의 분모·분자 근사의 상대오차 ≤ e^{δ_c} − 1 ≈ δ_c   (δ_c 작을 때)
+```
+
+**(b) 존 질량(mass) 비중.** 소프트맥스 분모에서 E 존이 차지하는 비율을
+
+```
+p_E = D_E / (D_S + D_R + D_E),   D_X = Σ_{i∈X} e^{sᵢ}
+```
+
+라 하면, retrieval이 **점수가 큰(=질량이 큰) 클러스터를 정확히** 가져가므로 남은 E는 저점수 → `p_E`가 작습니다.
+
+**(c) 출력 오차.** 출력은 존별 결과의 (분모 질량 가중) 볼록결합이라, 근사가 있는 곳은 E뿐이고 그 상대오차는 (a)로 경계됩니다. 대략:
+
+```
+||Ô − O*|| ⪅ p_E · (e^{δ_E} − 1) · (값 스케일)      # δ_E = max_c δ_c
+```
+
+즉 **출력 오차 ≈ (E 존 질량 비중 p_E) × (클러스터 내부 편차 δ_E)** 로, **두 작은 수의 곱**입니다. 이것이 "accuracy-bounded"의 실체입니다.
+
+### 17.6 왜 두 인자가 모두 작게 유지되나 — 설계와의 연결
+
+| 인자 | 작게 만드는 장치 |
+|---|---|
+| `p_E` (E 질량 비중) | **retrieval_budget↑** → 고질량 클러스터를 R로 흡수 → E엔 저점수만 남음. 또한 **steady 존**이 싱크·최근 등 항상-중요 토큰을 정확 처리 |
+| `δ_E` (클러스터 편차) | **클러스터 수↑**(n_centroids≈N/16) + **segmented k-means**로 공간 지역성 활용 → 반경 `r_c`↓ |
+
+두 손잡이가 독립적으로 오차의 두 인자를 누르므로, 예산 `retrieval 1.8% + estimation 23.2%`처럼 낮은 계산량에서도 정확도가 유지됩니다([10.3](#10-3-zone-세부-accuracy-bound)).
+
+### 17.7 estimation이 "그냥 버리기"보다 나은 이유 (수식으로)
+
+E를 **버리면**(일반 ANN) 분모가 `D_S+D_R`로 과소평가되어 남은 존에 과대 가중 → 편향 발생. 오차 ~ `p_E`(1차). **centroid 근사**는 `p_E` 부분을 다시 채우되 `δ_E`만큼만 틀리므로 오차 ~ `p_E·δ_E`(2차, 훨씬 작음). 즉 estimation은 오차의 차수를 한 단계 낮춥니다.
+
+### 17.8 한 줄 정리
+
+`weighted_flash_decoding`은 **각 key에 weight를 붙인 online-softmax flash decoding**이며, estimation은 여기에 `(centroid, value_sum, cluster_size)`를 넣어 클러스터 `c`가 분모에 `n_c·e^{s_c}`, 분자에 `e^{s_c}·V_c`를 기여하게 한다. 이 근사의 출력 오차는 **`p_E`(E 존 질량) × `δ_E`(클러스터 반경)** 로 경계되며, `retrieval_budget`과 클러스터 수가 각각을 눌러 정확도를 보장한다.
+
+### 참고문헌
+- Chen et al., *RetroInfer* (VLDB 2026). [arXiv:2505.02922](https://arxiv.org/abs/2505.02922) — accuracy-bounded attention estimation
+- Liu et al., *RetrievalAttention* (2024). [arXiv:2409.10516](https://arxiv.org/abs/2409.10516)
+- 포크: [Starmys/flash-attention@weighted](https://github.com/Starmys/flash-attention) — `weighted_flash_decoding`
+- 코드(호출부): [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`sparse_attention`, `dense_attention`)
