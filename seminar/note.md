@@ -18,6 +18,7 @@
 13. [CUDA Graph](#13-cuda-graph)
 14. [NUMA · 스레드풀](#14-numa--스레드풀)
 15. [NVIDIA A100 (Ampere) 구조](#15-nvidia-a100-ampere-구조)
+16. [RetroInfer 알고리즘 총정리 (End-to-End)](#16-retroinfer-알고리즘-총정리-end-to-end)
 
 ---
 
@@ -947,3 +948,144 @@ A100의 ~2TB/s HBM 대역폭도 어텐션의 **전량 KV 접근** 앞에서는 �
 - NVIDIA, *NVIDIA A100 Tensor Core GPU Architecture* 백서 (2020)
 - NVIDIA, *NVIDIA Ampere GA100 GPU Architecture*
 - 코드: [`library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu`](../library/retroinfer/retroinfer_kernels/src/batch_gemm_softmax.cu) (`memory_sm80.h`, `Sm80`), [`throughput_eval/`](../throughput_eval)
+
+---
+
+## 16. RetroInfer 알고리즘 총정리 (End-to-End)
+
+> 발표 자료 연관 슬라이드: **4~9 전체**. 앞 절들(3·5·9·10)에 흩어진 조각을 **하나의 알고리즘**으로 꿰는 절입니다.
+
+RetroInfer는 두 국면으로 나뉩니다: **① Prefill(인덱스 구축)** — 입력 컨텍스트를 한 번에 처리하며 wave index를 만들고, **② Decode(희소 어텐션)** — 토큰을 하나씩 생성하며 매 스텝 3-zone 어텐션을 수행합니다. 중간중간 **인덱스 증분 갱신**이 끼어듭니다.
+
+### 16.0 표기 · 자료구조
+
+| 기호 | 의미 |
+|---|---|
+| `N` | 컨텍스트 길이(토큰 수), `H`=query 헤드, `G`=KV 헤드, `d`=head_dim |
+| `n_centroids` | 클러스터 수 ≈ `N/16` (lcm(8,n_segment) 배수) |
+| `nprobe` | 검색할 클러스터 수 = `⌈n_centroids · retrieval_budget⌉` |
+| `es` | 추정할 클러스터 수 = `⌈n_centroids · estimation_budget⌉` |
+| `centroids` | 클러스터 대표 벡터 (검색 대상) |
+| `value_sum`, `cluster_size` | 클러스터별 V 합·토큰 수 (estimation용) |
+| `clusters` | 클러스터별 소속 토큰 id (retrieval gather용) |
+
+핵심 통찰(반복): **디코딩 1스텝의 어텐션 = "query에 가까운 key 검색(ANN)"**. 전량 계산 대신, 클러스터 인덱스로 관련 토큰만 골라 계산하고, 나머지는 centroid로 근사한다.
+
+### 16.1 국면 ① — Prefill: 인덱스 구축
+
+입력 컨텍스트의 K·V를 계산하면서, 그 K를 클러스터링해 wave index를 만듭니다.
+
+```text
+Prefill(input_tokens):
+  for each layer:
+    Q, K, V = QKV_proj(hidden)              # RoPE 적용 후 (7절)
+    O = prefill_attention(Q, K, V)          # full / xattn / minfer (8절)
+    hidden = O 처리 → 다음 레이어
+    # --- 인덱스 구축 (RetroInfer) ---
+    steady_zone ← 고정 토큰(싱크+최근)을 GPU에 별도 저장
+    centroids, value_sum, clusters, cluster_size
+        = segment_k_means(K, V, n_centroids, n_segment)   # 5절, Triton
+    WaveBufferCPU.async_construction(clusters, cluster_size)
+        # 클러스터별로 K·V를 CPU IVF 배열에 재조직 (스레드풀 병렬)
+```
+
+- prefill 자체 어텐션은 정확(full) 또는 prefill-희소(xattn/minfer)로 계산 — RetroInfer의 희소성은 **decode**에 적용됩니다.
+- 산출물(centroids/value_sum/clusters/cluster_size)이 이후 모든 decode 스텝의 검색 재료가 됩니다.
+- **비용**: 클러스터링은 `segmented`로 저렴(5절), CPU 재조직은 스레드풀로 병렬(14절).
+
+### 16.2 국면 ② — Decode: 3-zone 희소 어텐션 (핵심)
+
+매 토큰 생성 스텝마다, 각 레이어에서 `sparse_attention(query)`가 실행됩니다. 아래가 RetroInfer 알고리즘의 **심장**입니다(`cache_hub/retroinfer_cache.py`).
+
+```text
+sparse_attention(q):                        # q: 이번 스텝 query (그룹당 group_size개)
+  # ── 1. 클러스터 검색 (coarse search, ANN) ──
+  dist = Softmax(q · centroidsᵀ / √d)        # batch_gemm_softmax, Tensor Core (4절)
+  dist[빈 클러스터] = -inf
+  topIdx = topk(dist, nprobe + es)           # 상위 (검색+추정) 클러스터
+  retrievalIdx = topIdx[:nprobe]             # 정확 계산할 클러스터
+  esIdx        = topIdx[nprobe : nprobe+es]  # 근사할 클러스터
+
+  # ── 2. Estimation zone (근사) ──
+  gather (esIdx의) centroids, value_sum, cluster_size
+  es_out, es_lse = weighted_flash_decoding(  # centroid를 key로, value_sum/size로 근사
+        q, es_centroids, es_value_sum, es_cluster_size,
+        return_softmax_lse=True)             # (out, lse) 반환 (3절)
+
+  # ── 3. Wave Buffer 접근 (retrieval zone 준비) ──
+  WaveBuffer.batch_access(retrievalIdx):     # 9절
+      hit  → GPU 캐시 블록 재사용
+      miss → CPU에서 gather 필요 표시
+  (비동기) WaveBuffer.batch_update()          # LRU admit/evict (연산과 overlap)
+
+  # ── 4. 실행 버퍼 조립 (steady + retrieval) ──
+  gather_copy_and_concat(                     # copy_kernel.cuh
+      steady_zone, GPU캐시(hit), CPU(miss) → execution_buffer)
+
+  # ── 5. 정확 어텐션 + estimation 병합 ──
+  attn_out = weighted_flash_decoding(         # steady+retrieval 정확 계산
+      q, execution_buffer_K, execution_buffer_V,
+      previous_out=es_out, previous_lse=es_lse,   # ← estimation을 online-softmax 병합 (3절)
+      cache_seqlens=valid_lengths)
+
+  # ── 6. 캐시 admit ──
+  gather_copy_and_scatter(execution_buffer → GPU 블록 캐시)  # 사용 페이지 LRU 반영
+  return attn_out
+```
+
+**세 존이 하나로 합쳐지는 지점은 5번**입니다. estimation의 `(es_out, es_lse)`가 `previous_out/lse`로 들어가, steady+retrieval 정확 계산과 [online-softmax](#3-online-softmax-병합)로 정확히 병합됩니다 → 검색 누락 오차가 [경계 안에 갇힘](#10-3-zone-세부-accuracy-bound).
+
+```mermaid
+flowchart TD
+    Q["query (decode 1스텝)"] --> GEMM["1. dist = Softmax(q·Cᵀ)<br/>batch_gemm_softmax"]
+    GEMM --> TOPK["topk → nprobe + es"]
+    TOPK -->|es 클러스터| EST["2. estimation<br/>centroid 근사 → es_out, es_lse"]
+    TOPK -->|nprobe 클러스터| WB["3. WaveBuffer.batch_access<br/>hit/miss"]
+    WB --> CONCAT["4. gather_copy_and_concat<br/>steady + retrieval 조립"]
+    CONCAT --> ATTN["5. weighted_flash_decoding<br/>정확 어텐션"]
+    EST -->|previous_out/lse 병합| ATTN
+    ATTN --> ADMIT["6. scatter → LRU admit"]
+    ATTN --> OUT["attn_out"]
+    WB -.비동기.-> UPD["batch_update (LRU)"]
+```
+
+### 16.3 국면 ②' — 인덱스 증분 갱신
+
+디코딩 중 생성된 새 토큰의 K·V도 인덱스에 반영해야 합니다. 일정 주기(`UPDATE_SEGMENT=1024` 토큰)마다:
+
+```text
+if 누적 새 토큰 ≥ UPDATE_SEGMENT:
+    새 K를 segment_k_means로 추가 클러스터링 (nprobe_new개 증가)
+    WaveBufferCPU.update_kv(new_K, new_V, new_clusters, ...)  # 인덱스에 append
+```
+
+그 사이 생성된 토큰들은 steady zone(최근 토큰)에 포함되어 항상 정확히 반영되므로, 갱신 전에도 정확도 손실이 없습니다.
+
+### 16.4 CUDA Graph 경로
+
+`--use_cuda_graph` 시, 위 1·2·4·5·6 단계를 미리 그래프로 캡처하고 매 스텝 `replay`합니다(`sparse_attention_with_cudagraph`, 13절) — query만 고정 버퍼에 복사하고 나머지는 그래프 재생 → 커널 launch 오버헤드 제거.
+
+### 16.5 복잡도 — 왜 빨라지나
+
+| 단계 | 정확 어텐션(FlashAttention) | RetroInfer decode |
+|---|---|---|
+| 접근 KV | 전체 `N` | steady + `(nprobe+es)`개 클러스터 ≈ `budget · N` |
+| 스텝당 계산 | `O(N·d)` | `O(n_centroids·d)`(검색) + `O(budget·N·d)`(계산) |
+| KV 저장 | 전부 GPU | CPU + GPU 작업 버퍼 |
+
+`retrieval 1.8% + estimation 23.2%` 예산이면 **전체의 ~25% 클러스터만** 실제로 건드립니다 → 정확도 유지하며 처리량 4.5–10.5×.
+
+### 16.6 왜 정확도가 유지되는가 (요약)
+
+1. **steady** = 가장 중요한 고정 토큰을 항상 정확히.
+2. **retrieval** = softmax가 큰 가중치를 주는(=query에 가까운) 상위 클러스터를 정확히 — ANN이 이들을 잘 찾음(높은 recall).
+3. **estimation** = 나머지를 버리지 않고 centroid로 근사해 **분모에 반영** → 누락 오차를 경계.
+4. **online-softmax 병합** = 위 셋을 수학적으로 정확히 결합.
+
+### 16.7 한 줄 정리
+
+RetroInfer 알고리즘 = **"Prefill에서 K를 클러스터링해 wave index를 만들고(segmented k-means), Decode 매 스텝마다 query로 관련 클러스터를 검색(ANN)해 steady+retrieval는 정확히·estimation은 centroid로 근사한 뒤 online-softmax로 병합하며, CPU–GPU wave buffer가 KV 이동을 LRU·overlap으로 조율하는" 시스템.**
+
+### 참고문헌
+- Chen et al., *RetroInfer: A Vector Storage Engine for Scalable Long-Context LLM Inference*, VLDB 2026. [arXiv:2505.02922](https://arxiv.org/abs/2505.02922)
+- 코드: [`cache_hub/retroinfer_cache.py`](../cache_hub/retroinfer_cache.py) (`sparse_attention`, `prepare_cache`, `decode_update_kv_cache`), [`model_hub/LLM.py`](../model_hub/LLM.py) (`layer_prefill`, `layer_decode`)
